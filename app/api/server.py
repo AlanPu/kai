@@ -24,6 +24,7 @@ from ..core.content import load_content
 from ..core.voiceprint import SpeakerVerifier, load_voiceprint
 from ..services.corrector import Corrector
 from ..services.planner import Planner, build_tutor_instructions
+from ..services.cost import estimate_cost, format_usage, parse_realtime_usage
 from ..services.profile import (INJECT_MIN_CONFIDENCE, ProfileExtractor,
                                 ProfileStore)
 from ..services.session import ConversationSession
@@ -76,6 +77,41 @@ async def health():
         "model": s.qwen_model,
         "session_minutes": s.session_minutes,
         "voiceprint": s.voiceprint_path.is_file(),
+    }
+
+
+@app.get("/api/stats")
+async def stats():
+    """累计统计，含总花费估算。"""
+    sessions = db().list_sessions(limit=1000)
+    total_sec = sum(x.duration_sec or 0 for x in sessions)
+    done = [x for x in sessions if x.status == "finished"]
+
+    tokens = 0
+    cost = 0.0
+    for x in done:
+        if not x.usage_json:
+            continue
+        try:
+            import json as _json
+            u = parse_realtime_usage(_json.loads(x.usage_json))
+            tokens += u.total_tokens
+            cost += estimate_cost(u)
+        except Exception:
+            continue
+
+    total_chars = sum((x.user_char_count or 0) + (x.ai_char_count or 0)
+                      for x in done)
+    user_chars = sum(x.user_char_count or 0 for x in done)
+
+    return {
+        "sessions": len(sessions),
+        "finished": len(done),
+        "total_minutes": round(total_sec / 60, 1),
+        "total_tokens": tokens,
+        "cost_yuan": round(cost, 3),
+        "user_ratio": round(user_chars / total_chars, 3) if total_chars else 0,
+        "facts_learned": len(db().list_facts()),
     }
 
 
@@ -166,6 +202,17 @@ def _build_report(session_id: int) -> Optional[dict]:
     } for c in db().list_corrections(session_id)]
 
     total = (s.user_char_count or 0) + (s.ai_char_count or 0)
+
+    # 费用（用量在结束时存进 usage_json）
+    usage = None
+    if s.usage_json:
+        try:
+            import json as _json
+            usage = _json.loads(s.usage_json)
+        except Exception:
+            usage = None
+    u = parse_realtime_usage(usage)
+
     return {
         "id": s.id, "status": s.status, "duration_sec": s.duration_sec,
         "input_kind": s.input_kind, "title": s.input_title,
@@ -174,6 +221,11 @@ def _build_report(session_id: int) -> Optional[dict]:
         "ai_char_count": s.ai_char_count,
         "user_ratio": round(s.user_char_count / total, 3) if total else 0,
         "turns": turns, "corrections": corrections,
+        "usage": {
+            "total_tokens": u.total_tokens,
+            "text": format_usage(u),
+            "cost_yuan": estimate_cost(u),
+        } if u.total_tokens else None,
     }
 
 

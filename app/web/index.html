@@ -208,6 +208,7 @@ const $ = id => document.getElementById(id);
 let ws = null, micStream = null, worklet = null, srcNode = null;
 let ctxIn = null, ctxOut = null, playHead = 0;
 let running = false, prepared = null, reportShown = false;
+let lastContent = "", dropped = false, elapsedBefore = 0, reconnects = 0;
 
 function toast(msg, ms = 2600) {
   const t = $("toast");
@@ -337,10 +338,17 @@ function connect(content) {
     + "?content=" + encodeURIComponent(content) + "&voiceprint=" + vp);
   ws.binaryType = "arraybuffer";
   ws.onmessage = onServer;
-  ws.onclose = () => {
-    if (running && !reportShown) { toast("连接已断开"); cleanup(); }
+  ws.onclose = (ev) => {
+    if (!running || reportShown) return;
+    dropped = true;
+    cleanup();
+    // 明确告知，不假装没事：断线后 AI 的上下文已经没了，
+    // 静默重连会让用户以为还在接着聊，其实已经重开。
+    showDropped(ev && ev.code);
   };
-  ws.onerror = () => toast("连接出错，请检查网络与密钥配置");
+  ws.onerror = () => {
+    if (running && !reportShown) toast("连接出错", 3000);
+  };
 }
 
 function onServer(ev) {
@@ -381,6 +389,7 @@ function onServer(ev) {
   } else if (m.type === "voiceprint_stuck") {
     toast("声纹暂时无法判断，已先放行", 3000);
   } else if (m.type === "tick") {
+    elapsedBefore = m.elapsed_sec || 0;
     updateStats(m);
   } else if (m.type === "time_up") {
     toast("时间到，正在生成报告…");
@@ -440,6 +449,7 @@ function updateStats(m) {
 
 function cleanup() {
   running = false;
+  const keep = dropped;
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   if (srcNode) { try { srcNode.disconnect(); } catch (e) {} srcNode = null; }
   if (worklet) { try { worklet.disconnect(); } catch (e) {} worklet = null; }
@@ -447,6 +457,64 @@ function cleanup() {
   if (ctxOut) { try { ctxOut.close(); } catch (e) {} ctxOut = null; }
   $("dMic").classList.remove("live");
   $("dAi").classList.remove("live");
+  dropped = keep;
+}
+
+function showDropped(code) {
+  running = false;
+  const mins = Math.floor(elapsedBefore / 60);
+  const box = document.createElement("div");
+  box.id = "dropBox";
+  box.className = "card";
+  box.style.cssText = "margin-top:14px;border-color:#5a2b2b";
+  box.innerHTML =
+    '<h2 style="color:var(--err)">连接断开了</h2>'
+    + '<p class="hint" style="font-size:13px">'
+    + (mins > 0 ? '已经聊了 ' + mins + ' 分钟，' : '')
+    + '刚才的记录都保存下来了，不会丢。'
+    + '<br>但 AI 的上下文已经重置 —— 续接后会从今天的话题重新开始，'
+    + '它记不住断开前那几句的具体措辞。</p>'
+    + '<div class="ctrls" style="margin-top:12px">'
+    + '<button id="btnResume">继续练习</button>'
+    + '<button class="ghost" id="btnEndHere">就此结束，看报告</button>'
+    + '</div>'
+    + (code ? '<div class="hint">断开代码 ' + code + '（1006=网络中断，'
+       + '1011=服务端错误）</div>' : '');
+  const host = $("during").querySelector(".card");
+  const old = $("dropBox");
+  if (old) old.remove();
+  host.parentElement.appendChild(box);
+
+  $("btnResume").onclick = () => { box.remove(); resume(); };
+  $("btnEndHere").onclick = () => { box.remove(); finishNow(); };
+}
+
+async function resume() {
+  reconnects += 1;
+  if (reconnects > 3) {
+    toast("已经重连多次了，建议先检查网络", 4000);
+  }
+  $("duringHint").textContent = "重新连接中…";
+  try {
+    if (!ctxOut) ctxOut = new AudioContext({ sampleRate: OUT_RATE });
+    if (!micStream) await startMic();
+    $("dMic").classList.add("live");
+    dropped = false;
+    // 用同一段内容重开；话题规划会重新跑一遍（很快）
+    connect(lastContent);
+  } catch (e) {
+    toast("重新连接失败：" + e.message, 5000);
+    $("duringHint").textContent = "重连失败";
+  }
+}
+
+function finishNow() {
+  // 断线后无法通过 WS 收尾，直接拉取本地已保存的记录
+  showReport(null);
+  $("report").classList.remove("hidden");
+  $("reportBody").innerHTML =
+    '<p class="hint">连接已断开，无法生成完整报告。'
+    + '但这次练习的记录已保存，可以在「历史」里查看。</p>';
 }
 
 function showReport(r) {
@@ -469,6 +537,13 @@ function showReport(r) {
 
   if (ratio < 40) {
     html += '<p class="hint">这次 AI 说得偏多。下次可以就一个话题多说几句。</p>';
+  }
+
+  if (r.usage && r.usage.total_tokens) {
+    html += '<div class="stat"><span>用量</span><b>'
+      + r.usage.total_tokens.toLocaleString() + ' tokens</b></div>'
+      + '<div class="stat"><span>费用（估算）</span><b>约 '
+      + r.usage.cost_yuan.toFixed(3) + ' 元</b></div>';
   }
 
   const cs = r.corrections || [];
@@ -514,6 +589,8 @@ $("btnPrepare").onclick = async () => {
 $("btnStart").onclick = async () => {
   const content = ($("input").value || "").trim();
   if (!content) { toast("请先输入内容"); return; }
+  lastContent = content;
+  reconnects = 0; dropped = false; elapsedBefore = 0;
   $("btnStart").disabled = true;
   $("setup").classList.add("hidden");
   $("during").classList.remove("hidden");
@@ -598,14 +675,19 @@ $("profileModal").onclick = e => {
 };
 
 $("btnHistory").onclick = async () => {
-  const r = await fetch("/api/sessions?limit=20");
-  const d = await r.json();
+  const [rr, rs] = await Promise.all([
+    fetch("/api/sessions?limit=20"), fetch("/api/stats")]);
+  const d = await rr.json(), st = await rs.json();
   if (!d.sessions || !d.sessions.length) { toast("还没有练习记录"); return; }
+  const head = "累计 " + st.finished + " 次练习 · " + st.total_minutes
+    + " 分钟 · 约 " + st.cost_yuan.toFixed(2) + " 元 · 记住 "
+    + st.facts_learned + " 条信息\n"
+    + "平均我说话占 " + Math.round((st.user_ratio || 0) * 100) + "%";
   const lines = d.sessions.map(s => "#" + s.id + "  "
     + String(s.started_at || "").slice(5, 16) + "  "
     + (s.duration_sec ? fmt(s.duration_sec) : "—") + "  "
-    + (s.turn_count || 0) + "轮  " + String(s.title || "").slice(0, 30));
-  alert("最近的练习：\n\n" + lines.join("\n"));
+    + (s.turn_count || 0) + "轮  " + String(s.title || "").slice(0, 26));
+  alert(head + "\n\n最近的练习：\n\n" + lines.join("\n"));
 };
 
 fetch("/api/health").then(r => r.json()).then(h => {
