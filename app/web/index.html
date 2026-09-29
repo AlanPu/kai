@@ -141,6 +141,7 @@ h1{font-size:19px;margin:0;font-weight:600}
           <div id="log"></div>
           <div class="ctrls" style="margin-top:12px">
             <button id="btnStop" class="ghost">结束练习</button>
+            <button id="btnPause" class="ghost">暂停</button>
             <button id="btnSkip" class="ghost">换个话题</button>
             <div class="spacer"></div>
             <span class="hint" id="duringHint"></span>
@@ -184,6 +185,18 @@ h1{font-size:19px;margin:0;font-weight:600}
   </section>
 </div>
 
+<div id="pauseModal" class="hidden"
+  style="position:fixed;inset:0;background:rgba(8,10,14,.92);z-index:98;
+  display:flex;align-items:center;justify-content:center;padding:20px">
+  <div style="text-align:center">
+    <h1 style="font-size:26px;margin-bottom:10px">已暂停</h1>
+    <p class="hint" style="font-size:14px;margin-bottom:20px">
+      计时已停止，麦克风已静音。<br>
+      休息好了就继续 —— 断开前聊过的内容都还在。</p>
+    <button id="btnResume2">继续练习</button>
+  </div>
+</div>
+
 <div id="profileModal" class="hidden"
   style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;
   display:flex;align-items:center;justify-content:center;padding:20px">
@@ -209,7 +222,7 @@ let ws = null, micStream = null, worklet = null, srcNode = null;
 let ctxIn = null, ctxOut = null, playHead = 0;
 let running = false, prepared = null, reportShown = false;
 let lastContent = "", dropped = false, elapsedBefore = 0, reconnects = 0;
-let aborted = false;
+let aborted = false, paused = false;
 
 function toast(msg, ms = 2600) {
   const t = $("toast");
@@ -311,7 +324,7 @@ async function startMic() {
 
   worklet = new AudioWorkletNode(ctxIn, "pcm");
   worklet.port.onmessage = e => {
-    if (!running || !ws || ws.readyState !== 1) return;
+    if (!running || paused || !ws || ws.readyState !== 1) return;
     let f32 = e.data;
     if (Math.abs(ratio - 1) > 1e-6) {
       const n = Math.floor(f32.length / ratio);
@@ -395,6 +408,15 @@ function onServer(ev) {
   } else if (m.type === "time_up") {
     toast("时间到，正在生成报告…");
     reportShown = true;
+  } else if (m.type === "paused") {
+    paused = true;
+    elapsedBefore = m.elapsed_sec || 0;
+    stopPlayback();
+    $("pauseModal").classList.remove("hidden");
+  } else if (m.type === "resumed") {
+    paused = false;
+    $("pauseModal").classList.add("hidden");
+    toast("继续练习");
   } else if (m.type === "aborted") {
     // 服务端主动结束了会话（如长时间没听到说话）。
     // 如实告知原因，并保留已有记录。
@@ -655,6 +677,24 @@ $("btnStop").onclick = () => {
   if (!confirm("确定结束本次练习？")) return;
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "stop" }));
   else showReport(null);
+};
+
+function doPause() {
+  if (!ws || ws.readyState !== 1) { toast("连接已断开"); return; }
+  ws.send(JSON.stringify({ type: "pause" }));
+}
+
+$("btnPause").onclick = doPause;
+$("btnResume2").onclick = () => {
+  if (!ws || ws.readyState !== 1) {
+    // 暂停太久连接已断 —— 用户是主动暂停的，重连是预期内的
+    $("pauseModal").classList.add("hidden");
+    paused = false;
+    toast("连接已断开，正在重新连接…");
+    resume();
+    return;
+  }
+  ws.send(JSON.stringify({ type: "resume" }));
 };
 
 $("btnSkip").onclick = () => {

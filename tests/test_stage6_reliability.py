@@ -293,3 +293,106 @@ def test_fatal_message_is_human_readable():
     assert _fatal_message("insufficient_quota")
     # 未知错误也要能给出可读文本
     assert _fatal_message("some_unknown_thing")
+
+
+# ============================================================
+#  暂停 / 恢复
+# ============================================================
+
+def _bare_session():
+    """构造一个不连网的最小会话，只测计时逻辑。"""
+    import time
+    from app.services.session import ConversationSession, SessionStats
+    s = ConversationSession.__new__(ConversationSession)
+    s.stats = SessionStats()
+    s.started_at = time.time()
+    s.paused = False
+    s.paused_total = 0.0
+    s._paused_at = None
+    s.ended = False
+    s.duration_limit = 1800
+    return s
+
+
+def test_pause_stops_the_clock():
+    """暂停期间不该计时 —— 中途去倒杯水不该算进练习时长。"""
+    import time
+    s = _bare_session()
+    time.sleep(0.2)
+    before = s.elapsed()
+    s.pause()
+    time.sleep(0.5)
+    assert abs(s.elapsed() - before) < 0.1, "暂停后 elapsed 不该增长"
+
+
+def test_unpause_resumes_the_clock():
+    import time
+    s = _bare_session()
+    s.pause()
+    time.sleep(0.3)
+    s.unpause()
+    time.sleep(0.2)
+    assert s.elapsed() > 0.15, "恢复后应继续计时"
+    assert s.paused_total >= 0.25
+
+
+def test_remaining_sec_excludes_pause():
+    """剩余时间也要排除暂停，否则用户歇一会儿就被判超时。"""
+    import time
+    s = _bare_session()
+    s.duration_limit = 10
+    s.pause()
+    time.sleep(0.5)
+    s.unpause()
+    assert s.remaining_sec() >= 9, "暂停不该消耗配额时间"
+
+
+def test_pause_twice_is_idempotent():
+    """重复暂停不能把暂停起点刷新，否则暂停时长会算错。"""
+    import time
+    s = _bare_session()
+    s.pause()
+    first = s._paused_at
+    time.sleep(0.15)
+    s.pause()
+    assert s._paused_at == first
+
+
+def test_unpause_without_pause_is_safe():
+    s = _bare_session()
+    s.unpause()          # 不应抛出
+    assert not s.paused
+    assert s.paused_total == 0.0
+
+
+@pytest.mark.asyncio
+async def test_paused_session_drops_audio():
+    """
+    暂停期间必须丢弃音频。
+
+    否则麦克风收到的环境音会照常上传，
+    既可能误触发 Qwen 的说话检测，也让 AI 对着空房间回话。
+    """
+    from app.services.session import ConversationSession, SessionStats
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.paused = True
+    s.ended = False
+    s.stats = SessionStats()
+    s.rt = object()                       # 非 None，确保是 paused 拦下的
+    s.verifier = None
+    s._model_speaking = False
+
+    sent = []
+    s.stats.audio_in_blocks = 0
+    await ConversationSession.push_audio(s, b"\x00" * 640)
+    assert s.stats.audio_in_blocks == 0, "暂停时不该处理音频"
+
+
+def test_snapshot_reports_paused_state():
+    """前端要靠 snapshot 知道当前是否暂停。"""
+    s = _bare_session()
+    s.pause()
+    snap = s.snapshot()
+    assert snap["paused"] is True
+    assert "paused_sec" in snap

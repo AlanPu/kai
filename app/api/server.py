@@ -430,6 +430,14 @@ async def _handle_cmd(cmd: dict, sess: ConversationSession) -> None:
         raise _StopRequested()
     elif t == "status":
         await sess.on_client({"type": "stats", **sess.snapshot()})
+    elif t == "pause":
+        # 用户中途离开。暂停期间不计时、不收音频，
+        # 避免触发 Qwen 的 300 秒空闲关闭。
+        sess.pause()
+        await sess.on_client({"type": "paused", **sess.snapshot()})
+    elif t == "resume":
+        sess.unpause()
+        await sess.on_client({"type": "resumed", **sess.snapshot()})
 
 
 async def _timer_loop(ws: WebSocket, sess: ConversationSession) -> None:

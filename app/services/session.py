@@ -81,6 +81,13 @@ class ConversationSession:
 
         self.stats = SessionStats()
         self.fatal_error: Optional[str] = None
+
+        # 暂停：用户中途离开时不计时。
+        # 起因：Qwen 在 300 秒无有效语音输入后会关闭会话，
+        # 而一次 30 分钟的练习中途离开几分钟很正常。
+        self.paused = False
+        self.paused_total = 0.0
+        self._paused_at: Optional[float] = None
         self.started_at = time.time()
         self.duration_limit = (minutes or settings.session_minutes) * 60
 
@@ -136,7 +143,8 @@ class ConversationSession:
         except Exception as e:
             log.warning("结束时画像冲刷失败: %s", e)
 
-        elapsed = int(time.time() - self.started_at)
+        # 用 elapsed()：暂停的时间不算练习时长
+        elapsed = int(self.elapsed())
         usage = self.rt.last_usage if self.rt else None
         self.db.refresh_session_stats(self.session_id)
         self.db.finish_session(self.session_id, status=status,
@@ -148,13 +156,17 @@ class ConversationSession:
         """
         处理一块来自浏览器的 16 kHz PCM。
 
+        暂停期间直接丢弃：用户离开了，麦克风收到什么与我们无关，
+        送上去只会让 Qwen 的空闲计时被误重置、也让 AI 对空气说话。
+
         声纹开启时的三种情形：
           · 静音        → 攒入待定缓冲
           · 判定未知    → 攒入待定缓冲（不放行！）
           · 判定为本人  → 放行（含之前攒的）
           · 判定非本人  → 丢弃缓冲并通知前端
         """
-        if self.ended or not self.rt:
+
+        if self.paused or self.ended or not self.rt:
             return
 
         # AI 说话期间不处理输入，避免自我对话
@@ -358,15 +370,44 @@ class ConversationSession:
 
     # ---------- 计时 ----------
 
+    # ---------- 暂停 ----------
+
+    def pause(self) -> None:
+        """用户中途离开。暂停期间不计时、不收音频。"""
+        if self.paused or self.ended:
+            return
+        self.paused = True
+        self._paused_at = time.time()
+
+    def unpause(self) -> None:
+        if not self.paused:
+            return
+        self.paused = False
+        if self._paused_at:
+            self.paused_total += time.time() - self._paused_at
+        self._paused_at = None
+
+    def elapsed(self) -> float:
+        """已进行秒数，不含暂停时间。"""
+        if not self.started_at:
+            return 0.0
+        e = time.time() - self.started_at - self.paused_total
+        if self.paused and self._paused_at:
+            e -= (time.time() - self._paused_at)
+        return max(0.0, e)
+
     def remaining_sec(self) -> int:
-        return max(0, int(self.duration_limit - (time.time() - self.started_at)))
+        # 用 elapsed() 而非直接减 started_at —— 暂停的时间不该计时
+        return max(0, int(self.duration_limit - self.elapsed()))
 
     def is_expired(self) -> bool:
         return self.remaining_sec() <= 0
 
     def snapshot(self) -> dict:
         return {
-            "elapsed_sec": int(time.time() - self.started_at),
+            "elapsed_sec": int(self.elapsed()),
+            "paused": self.paused,
+            "paused_sec": int(self.paused_total),
             "remaining_sec": self.remaining_sec(),
             "audio_in_blocks": self.stats.audio_in_blocks,
             "audio_out_blocks": self.stats.audio_out_blocks,
