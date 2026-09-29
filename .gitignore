@@ -38,3 +38,5 @@ models/
 .DS_Store
 .idea/
 .vscode/
+# TTS 生成的测试音频，用 scripts/make_sample_speech.py 重新生成
+scripts/sample_speech.pcm
