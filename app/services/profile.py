@@ -137,6 +137,21 @@ INJECT_MIN_CONFIDENCE = 0.6
 MAX_INJECT_FACTS = 25
 
 
+def _group_by_category(facts: list[ProfileFact],
+                       ) -> dict[str, list[ProfileFact]]:
+    """按分类分组，组内按置信度从高到低。
+
+    summary() 和 write_markdown() 都要这个，
+    抽出来避免两处各写一遍、后续改漏一处。
+    """
+    by_cat: dict[str, list[ProfileFact]] = {}
+    for f in facts:
+        by_cat.setdefault(f.category, []).append(f)
+    for group in by_cat.values():
+        group.sort(key=lambda x: -x.confidence)
+    return by_cat
+
+
 class ProfileStore:
     """画像的读写与注入。"""
 
@@ -169,9 +184,7 @@ class ProfileStore:
         if not facts:
             return ""
 
-        by_cat: dict[str, list[ProfileFact]] = {}
-        for f in facts:
-            by_cat.setdefault(f.category, []).append(f)
+        by_cat = _group_by_category(facts)
 
         lines: list[str] = []
         used = 0
@@ -179,8 +192,6 @@ class ProfileStore:
             group = by_cat.get(cat)
             if not group:
                 continue
-            # 同一分类内按置信度排序
-            group.sort(key=lambda x: -x.confidence)
             items = []
             for f in group:
                 if used >= max_facts:
@@ -202,9 +213,7 @@ class ProfileStore:
         p = path or (self.dir / "profile.md")
 
         facts = self.db.list_facts()
-        by_cat: dict[str, list[ProfileFact]] = {}
-        for f in facts:
-            by_cat.setdefault(f.category, []).append(f)
+        by_cat = _group_by_category(facts)
 
         lines = [
             "# 我的英语学习画像",
@@ -222,7 +231,7 @@ class ProfileStore:
                 continue
             lines.append(f"## {label}")
             lines.append("")
-            for f in sorted(group, key=lambda x: -x.confidence):
+            for f in group:
                 star = "●" if f.confidence >= 0.8 else \
                        "○" if f.confidence >= 0.6 else "·"
                 lines.append(f"- {star} **{f.value}** "

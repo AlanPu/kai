@@ -7,6 +7,7 @@
   · 长时间稳定性从未验证（原型遗留债务）
 """
 
+import asyncio
 import json
 
 import pytest
@@ -502,3 +503,137 @@ def test_stats_has_speech_start_counter():
     """
     from app.services.session import SessionStats
     assert SessionStats().user_speech_starts == 0
+
+
+# ============================================================
+#  上下文轮转（Qwen 的 320 条 audio item 上限）
+# ============================================================
+
+def test_audio_limit_constants_are_conservative():
+    """
+    轮转阈值必须比真实上限保守。
+
+    我数的是 input_audio_buffer.committed（只在用户侧），
+    而服务端计的是全部 audio item（还含 AI 的输出）。
+    实测每轮对话我数到约 2 条、服务端约 2.6 条，
+    所以数到 240 就该轮转，等到 320 就来不及了。
+    """
+    from app.services.session import (AUDIO_ITEM_LIMIT,
+                                      AUDIO_ITEM_ROTATE_AT)
+    assert AUDIO_ITEM_LIMIT == 320, "Qwen 的硬上限"
+    assert AUDIO_ITEM_ROTATE_AT < AUDIO_ITEM_LIMIT
+    # 留足余量：至少 15%（约 15 轮对话）
+    assert AUDIO_ITEM_ROTATE_AT <= AUDIO_ITEM_LIMIT * 0.85
+
+
+def test_recoverable_error_detection():
+    """Too many audios 必须是可恢复的，不能当致命错误结束会话。"""
+    from app.core.realtime import is_recoverable_error
+    assert is_recoverable_error(
+        "InvalidParameter: Too many audios. The maximum allowed is 320.")
+    assert is_recoverable_error("too_many_audios")
+    # 真正的致命错误不能被误判成可恢复
+    assert not is_recoverable_error("user_idle_timeout")
+    assert not is_recoverable_error("invalid_api_key")
+    assert not is_recoverable_error("")
+
+
+def test_recoverable_is_checked_before_fatal():
+    """
+    Too many audios 的 code 是 InvalidParameter，
+    消息里才带 Too many audios。若先判 is_fatal_error，
+    会被当成致命错误直接结束会话 —— 顺序不能反。
+    """
+    import pathlib
+    src = pathlib.Path(
+        "./app/services/session.py"
+    ).read_text()
+    i_rec = src.index("is_recoverable_error(msg)")
+    i_fat = src.index("is_fatal_error(code)")
+    assert i_rec < i_fat, "可恢复判断必须先于致命判断"
+
+
+@pytest.mark.asyncio
+async def test_committed_event_counts_audio_items():
+    """每个 committed 都要计数，这是轮转的触发依据。"""
+    from app.services.session import ConversationSession, SessionStats
+
+    async def on_client(m):
+        pass
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.on_client = on_client
+    s.ended = False
+    s.verifier = None
+    s.stats = SessionStats()
+    s._model_speaking = False
+    s._rotate_at = 3
+    s._rotating = False
+    s._want_rotate = False
+
+    for expect in (1, 2):
+        await ConversationSession._on_qwen_event(
+            s, {"type": "input_audio_buffer.committed"})
+        assert s.stats.audio_items == expect
+    assert s.wants_rotate() is False, "还没到阈值不该请求轮转"
+
+    await ConversationSession._on_qwen_event(
+        s, {"type": "input_audio_buffer.committed"})
+    assert s.wants_rotate() is True, "到阈值应请求轮转"
+
+
+@pytest.mark.asyncio
+async def test_rotation_is_not_triggered_inside_recv_callback():
+    """
+    轮转只能在 recv 回调之外执行。
+
+    曾经的实现直接在回调里 await rotate_context()，
+    而它会关掉正在跑这个回调的连接 —— 接收循环被掐断，
+    异常冒泡出去整个会话被判异常结束。
+    所以回调里只能置标志。
+    """
+    from app.services.session import ConversationSession, SessionStats
+
+    async def on_client(m):
+        pass
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.on_client = on_client
+    s.ended = False
+    s.verifier = None
+    s.stats = SessionStats()
+    s._model_speaking = False
+    s._rotate_at = 1
+    s._rotating = False
+    s._want_rotate = False
+    s._correction_tasks = set()
+
+    called = []
+
+    async def fake_rotate():
+        called.append(1)
+        return True
+
+    s.rotate_context = fake_rotate
+
+    await ConversationSession._on_qwen_event(
+        s, {"type": "input_audio_buffer.committed"})
+    await asyncio.sleep(0)          # 让可能被创建的任务跑一下
+
+    assert s.wants_rotate() is True
+    assert called == [], "回调里不能直接执行轮转"
+
+
+def test_wants_rotate_is_consumed_once():
+    """
+    轮转标志必须只被消费一次。
+
+    否则 timer 循环每 5 秒重试，一次会话里会反复重连。
+    """
+    import pathlib
+    src = pathlib.Path(
+        "./app/services/session.py"
+    ).read_text()
+    i = src.index("async def rotate_context")
+    body = src[i:i + 900]
+    assert "_want_rotate = False" in body, "进入轮转时应先清标志"

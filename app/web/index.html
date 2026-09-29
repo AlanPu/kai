@@ -408,6 +408,10 @@ function onServer(ev) {
   } else if (m.type === "time_up") {
     toast("时间到，正在生成报告…");
     reportShown = true;
+  } else if (m.type === "context_rotated") {
+    // 服务端整理对话记忆后重连。用户只需要知道「刚才顿了一下」，
+    // 不需要理解 audio item 上限 —— 所以只给一句轻提示。
+    toast(m.message || "对话记忆已整理，继续聊。");
   } else if (m.type === "paused") {
     paused = true;
     elapsedBefore = m.elapsed_sec || 0;

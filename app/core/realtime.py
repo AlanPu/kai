@@ -35,6 +35,23 @@ class SessionFatal(Exception):
 
 
 # 这些错误意味着连接已经没用了，继续等只是浪费时间
+# 「audio item 数量超限」是可恢复的：重建连接即可继续，
+# 不该当成致命错误直接结束会话。
+RECOVERABLE_CODES = {
+    "too_many_audios",
+}
+
+
+def is_recoverable_error(code: str) -> bool:
+    """audio item 超限等错误可以通过重连恢复。"""
+    if not code:
+        return False
+    c = code.lower()
+    if c in RECOVERABLE_CODES:
+        return True
+    return "too many audio" in c or "too_many_audio" in c
+
+
 FATAL_CODES = {
     "user_idle_timeout",     # 用户长时间没说话，服务端关闭
     "session_expired",

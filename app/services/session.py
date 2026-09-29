@@ -19,6 +19,7 @@ import numpy as np
 from ..core.audio import rms
 from ..core.config import Settings
 from ..core.realtime import (RealtimeSession, SessionFatal, extract_ai_text,
+                             is_recoverable_error,
                              extract_audio_delta, extract_transcript,
                              is_fatal_error, is_speech_started)
 from ..core.voiceprint import SpeakerVerifier
@@ -32,6 +33,18 @@ log = logging.getLogger(__name__)
 
 
 SendToClient = Callable[[dict], Awaitable[None]]
+
+# Qwen 每条会话最多 320 条 audio item，超出会报
+# InvalidParameter: Too many audios 并断开连接。
+# 实测：连续对话约 12.5 分钟撞到上限。
+AUDIO_ITEM_LIMIT = 320
+# 提前轮转的阈值。
+#
+# 我数的是 input_audio_buffer.committed，而服务端计的是全部
+# audio item（还含 AI 的输出 item），所以我数到的数字偏小 ——
+# 实测每轮对话我数到约 2 条，而服务端计约 2.6 条。
+# 因此阈值要保守：数到 240 就轮转，别等真到 320 才反应。
+AUDIO_ITEM_ROTATE_AT = 240
 
 # 静音门槛（int16 量级）：低于此值不送声纹判定，但仍积累在待定缓冲
 VOICE_RMS_FLOOR = 120
@@ -50,6 +63,9 @@ class SessionStats:
     # 用户开始说话的次数。用来识别"每句都只说一次就没了"这类问题 ——
     # 如果它只涨到 1，说明用户说完第一句后再也发不出声音。
     user_speech_starts: int = 0
+    # 已消耗的 audio item 数。Qwen 上限是每条会话 320 条，
+    # 撞上会直接报 InvalidParameter 并断开。
+    audio_items: int = 0
 
 
 class ConversationSession:
@@ -91,6 +107,11 @@ class ConversationSession:
         self.paused = False
         self.paused_total = 0.0
         self._paused_at: Optional[float] = None
+
+        self._rotate_at = AUDIO_ITEM_ROTATE_AT
+        self._rotating = False
+        # 由外部循环轮询：轮转必须在 recv 循环之外执行
+        self._want_rotate = False
         self.started_at = time.time()
         self.duration_limit = (minutes or settings.session_minutes) * 60
 
@@ -243,6 +264,19 @@ class ConversationSession:
             err = ev.get("error") or {}
             code = str(err.get("code") or err.get("type") or "")
             await self.on_client({"type": "error", "error": err})
+
+            # audio item 超限是可恢复的 —— 重建连接就能继续。
+            # 必须先于 is_fatal_error 判断：这个错误的 code 是
+            # InvalidParameter，而消息里才带 Too many audios。
+            msg = str(err.get("message", "")) + str(code)
+            if is_recoverable_error(msg):
+                # 只置标志，真正的重连由外部循环执行。
+                # 不能在这里直接关连接 —— 会掐断正在跑本回调的
+                # _recv_loop，异常冒泡出去整个会话就被判异常结束。
+                log.warning("audio item 超限，请求轮转")
+                self._want_rotate = True
+                return
+
             if is_fatal_error(code):
                 # 服务端已经关掉会话了。必须如实结束，
                 # 否则会继续假装正常运行 —— 实测见过报错后
@@ -257,6 +291,16 @@ class ConversationSession:
         if audio:
             self.stats.audio_out_blocks += 1
             await self.on_client({"type": "audio", "pcm": _b64(audio)})
+            return
+
+        # 每个 input_audio_buffer.committed 都产生一条 audio item，
+        # 累加用于在撞上 320 上限前主动轮转
+        if t == "input_audio_buffer.committed":
+            self.stats.audio_items += 1
+            if (self.stats.audio_items >= self._rotate_at
+                    and not self._rotating):
+                # 同样只置标志，交给外部循环执行
+                self._want_rotate = True
             return
 
         if is_speech_started(ev):
@@ -382,6 +426,87 @@ class ConversationSession:
 
     # ---------- 计时 ----------
 
+    def wants_rotate(self) -> bool:
+        """是否有待处理的轮转请求（由外部循环消费）。"""
+        return self._want_rotate
+
+    # ---------- 上下文轮转 ----------
+
+    async def rotate_context(self) -> bool:
+        """
+        撞上 audio item 上限前重建连接，保留对话记忆。
+
+        Qwen 每条会话最多 320 条 audio item（实测约 12.5 分钟到顶），
+        超出会直接报错断开。这里在接近上限时主动重连，
+        并把最近几轮对话写成摘要带进新的 instructions，
+        用户感受是一句话的停顿，而不是突然掉线。
+
+        返回是否轮转成功。
+        """
+        # 无论成败都先清标志，避免外部循环每 5 秒重试一次
+        self._want_rotate = False
+        if self.ended or self._rotating or not self.rt:
+            return False
+        self._rotating = True
+
+        log.info("上下文轮转：已用 %d/%d audio item",
+                 self.stats.audio_items, AUDIO_ITEM_LIMIT)
+
+        # 用最近的对话生成承接语，让新一轮知道刚才聊到哪
+        recent = self.db.list_turns(self.session_id)[-12:]
+        if recent:
+            lines = []
+            for t in recent:
+                who = "Student" if t.role == "user" else "You"
+                lines.append(f"{who}: {t.text[:200]}")
+            carry = ("\n\n## 刚才的对话（你要接着聊，不要重新自我介绍）\n"
+                     + "\n".join(lines))
+        else:
+            carry = ""
+
+        try:
+            await self.rt.close()
+        except Exception as e:
+            log.warning("轮转时关闭旧连接失败: %s", e)
+
+        try:
+            self.rt = RealtimeSession(
+                self.s,
+                instructions=self.instructions + carry,
+                voice=self.s.qwen_voice,
+                on_event=self._on_qwen_event,
+            )
+            await self.rt.connect()
+        except Exception as e:
+            log.error("轮转重连失败: %s", e)
+            self._rotating = False
+            return False
+        self._rotating = False
+
+        self.stats.audio_items = 0
+        self._rotate_at = AUDIO_ITEM_ROTATE_AT
+        self._model_speaking = False
+        if self.verifier:
+            self.verifier.reset()
+
+        # 新连接必须重新触发说话，否则轮转完就是一片沉默。
+        # Realtime API 永远不会自己开口 —— 这一点在开场白那里
+        # 已经踩过一次，重连后同理。
+        try:
+            await self.rt.request_response(
+                "Continue the conversation naturally. Do NOT introduce "
+                "yourself again and do NOT restart the topic. Pick up "
+                "where you left off with one short reaction and one "
+                "open question.")
+        except Exception as e:
+            log.warning("轮转后触发说话失败: %s", e)
+
+        await self.on_client({
+            "type": "context_rotated",
+            "message": "对话记忆已整理，继续聊。",
+        })
+        return True
+
     # ---------- 暂停 ----------
 
     def pause(self) -> None:
@@ -425,6 +550,7 @@ class ConversationSession:
             "audio_out_blocks": self.stats.audio_out_blocks,
             "blocked_chunks": self.stats.blocked_chunks,
             "user_speech_starts": self.stats.user_speech_starts,
+            "audio_items": self.stats.audio_items,
             "blocked_sec": round(self.stats.blocked_sec, 1),
             "user_chars": self.stats.user_chars,
             "ai_chars": self.stats.ai_chars,

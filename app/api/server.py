@@ -441,9 +441,24 @@ async def _handle_cmd(cmd: dict, sess: ConversationSession) -> None:
 
 
 async def _timer_loop(ws: WebSocket, sess: ConversationSession) -> None:
-    """到点自动结束（需求：每次约 30 分钟）。"""
+    """到点自动结束（需求：每次约 30 分钟）+ 上下文轮转看护。"""
     while not sess.ended:
         await asyncio.sleep(5)
+
+        # 上下文轮转必须在这里做，不能在 Qwen 的 recv 回调里做：
+        # 那里关连接会掐断正在执行回调的接收循环，
+        # 异常冒泡出去整个会话会被判异常结束（实测踩过）。
+        if sess.wants_rotate() and not sess.ended:
+            log.info("执行上下文轮转")
+            ok = await sess.rotate_context()
+            if not ok:
+                await sess.on_client({
+                    "type": "error",
+                    "error": {"code": "rotate_failed",
+                              "message": "对话记忆整理失败，"
+                                         "建议结束本轮重新开始"},
+                })
+
         snap = sess.snapshot()
         await sess.on_client({
             "type": "tick",
