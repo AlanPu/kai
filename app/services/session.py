@@ -25,6 +25,7 @@ from ..core.voiceprint import SpeakerVerifier
 from ..storage.db import Database
 from ..storage.models import Correction, Turn
 from .corrector import Corrector
+from .profile import ProfileExtractor, ProfileStore
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,8 @@ class ConversationSession:
                  voiceprint: Optional[SpeakerVerifier] = None,
                  verifier_threshold: float = 0.5,
                  corrector: Optional[Corrector] = None,
+                 profile_store: Optional[ProfileStore] = None,
+                 profile_extractor: Optional[ProfileExtractor] = None,
                  minutes: Optional[int] = None):
         self.s = settings
         self.db = db
@@ -67,6 +70,12 @@ class ConversationSession:
         self.on_client = on_client
         self.verifier = voiceprint
         self.corrector = corrector
+        self.profile_store = profile_store
+        self.profile_extractor = profile_extractor
+
+        # 攒够一定量的用户发言才做一次画像抽取（省钱、少打扰）
+        self._user_since_extract: list[str] = []
+        self._extract_threshold = 5
 
         self.stats = SessionStats()
         self.started_at = time.time()
@@ -117,6 +126,12 @@ class ConversationSession:
 
         if self.rt:
             await self.rt.close()
+
+        # 结束前把剩下的发言也抽一次画像
+        try:
+            await self.flush_profile()
+        except Exception as e:
+            log.warning("结束时画像冲刷失败: %s", e)
 
         elapsed = int(time.time() - self.started_at)
         usage = self.rt.last_usage if self.rt else None
@@ -256,6 +271,15 @@ class ConversationSession:
             self._correction_tasks.add(task)
             task.add_done_callback(self._correction_tasks.discard)
 
+        # 画像抽取：攒够若干句做一次，避免每句都调模型
+        if self.profile_extractor is not None:
+            self._user_since_extract.append(text)
+            if len(self._user_since_extract) >= self._extract_threshold:
+                batch, self._user_since_extract = self._user_since_extract, []
+                task = asyncio.create_task(self._extract_profile(batch))
+                self._correction_tasks.add(task)
+                task.add_done_callback(self._correction_tasks.discard)
+
     async def _on_ai_text(self, text: str) -> None:
         self.stats.ai_chars += len(text)
         self.db.add_turn(Turn(session_id=self.session_id,
@@ -289,6 +313,35 @@ class ConversationSession:
                     "explanation": c.explanation,
                     "word": c.word, "phonetic": c.phonetic,
                 })
+
+    async def _extract_profile(self, texts: list[str]) -> None:
+        """从一批发言中抽取画像事实并累积（需求 6）。"""
+        if not self.profile_extractor or not self.profile_store:
+            return
+        try:
+            facts = await asyncio.to_thread(self.profile_extractor.extract, texts)
+        except Exception as e:
+            log.warning("画像抽取失败: %s", e)
+            return
+        if not facts or self.ended:
+            return
+        try:
+            n = self.profile_store.absorb(facts, session_id=self.session_id)
+            log.info("画像更新 %d 条: %s", n,
+                     ", ".join(f"{f.key}={f.value}" for f in facts[:4]))
+            await self.on_client({
+                "type": "profile_learned",
+                "facts": [{"category": f.category, "value": f.value}
+                          for f in facts],
+            })
+        except Exception as e:
+            log.warning("画像入库失败: %s", e)
+
+    async def flush_profile(self) -> None:
+        """会话结束时把剩余的发言也抽一次，别浪费。"""
+        if self._user_since_extract:
+            batch, self._user_since_extract = self._user_since_extract, []
+            await self._extract_profile(batch)
 
     # ---------- 计时 ----------
 

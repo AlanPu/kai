@@ -24,6 +24,8 @@ from ..core.content import load_content
 from ..core.voiceprint import SpeakerVerifier, load_voiceprint
 from ..services.corrector import Corrector
 from ..services.planner import Planner, build_tutor_instructions
+from ..services.profile import (INJECT_MIN_CONFIDENCE, ProfileExtractor,
+                                ProfileStore)
 from ..services.session import ConversationSession
 from ..storage.db import Database
 
@@ -41,6 +43,10 @@ def settings() -> Settings:
     if _settings is None:
         _settings = load_settings()
     return _settings
+
+
+def profile_store() -> ProfileStore:
+    return ProfileStore(db(), settings().profiles_dir)
 
 
 def db() -> Database:
@@ -98,9 +104,14 @@ async def prepare(body: PrepareIn):
     if not content.ok:
         raise HTTPException(400, f"内容无法处理：{content.error}")
 
+    # 需求 6：把已知画像注入，让话题更贴近本人
+    store = profile_store()
+    summary = store.summary()
+
     try:
         plan = await asyncio.to_thread(
-            Planner().plan, content, n_topics=max(3, min(body.topics, 8)))
+            Planner().plan, content, profile_summary=summary,
+            n_topics=max(3, min(body.topics, 8)))
     except Exception as e:
         raise HTTPException(502, f"话题规划失败：{e}")
 
@@ -164,6 +175,33 @@ def _build_report(session_id: int) -> Optional[dict]:
         "user_ratio": round(s.user_char_count / total, 3) if total else 0,
         "turns": turns, "corrections": corrections,
     }
+
+
+@app.get("/api/profile")
+async def get_profile():
+    """已积累的画像，供界面展示与用户检查。"""
+    store = profile_store()
+    facts = db().list_facts()
+    return {
+        "count": len(facts),
+        "facts": [{
+            "category": f.category, "key": f.key, "value": f.value,
+            "confidence": round(f.confidence, 2),
+            "source_session_id": f.source_session_id,
+        } for f in facts],
+        "summary": store.summary(min_confidence=INJECT_MIN_CONFIDENCE),
+        "issues": store.language_issues(),
+    }
+
+
+@app.post("/api/profile/export")
+async def export_profile():
+    """导出为 Markdown，便于人工查看与修正。"""
+    try:
+        p = profile_store().write_markdown()
+    except Exception as e:
+        raise HTTPException(500, f"导出失败：{e}")
+    return {"path": str(p), "text": p.read_text(encoding="utf-8")}
 
 
 # ============================================================
@@ -230,7 +268,10 @@ async def ws_session(ws: WebSocket):
                 except Exception as e:
                     log.warning("声纹加载失败，改为不过滤: %s", e)
 
-        instructions = build_tutor_instructions(plan, minutes=minutes)
+        store = profile_store()
+        summary = store.summary()
+        instructions = build_tutor_instructions(
+            plan, profile_summary=summary, minutes=minutes)
 
         async def on_client(msg: dict) -> None:
             try:
@@ -241,7 +282,8 @@ async def ws_session(ws: WebSocket):
         sess = ConversationSession(
             s, db(), session_id=sid, instructions=instructions,
             on_client=on_client, voiceprint=verifier,
-            corrector=Corrector(), minutes=minutes)
+            corrector=Corrector(), profile_store=store,
+            profile_extractor=ProfileExtractor(), minutes=minutes)
 
         await sess.start()
         await ws.send_json({"type": "session", "session_id": sid,

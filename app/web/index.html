@@ -98,6 +98,7 @@ h1{font-size:19px;margin:0;font-weight:600}
     <span class="pill" id="pVoice">—</span>
     <span class="pill" id="pVp">—</span>
     <div class="spacer"></div>
+    <button class="ghost" id="btnProfile">我的画像</button>
     <button class="ghost" id="btnHistory">历史</button>
   </header>
 
@@ -181,6 +182,20 @@ h1{font-size:19px;margin:0;font-weight:600}
       </div>
     </div>
   </section>
+</div>
+
+<div id="profileModal" class="hidden"
+  style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;
+  display:flex;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="max-width:620px;width:100%;max-height:80vh;
+    overflow-y:auto">
+    <div class="ctrls" style="margin-bottom:12px">
+      <h2 style="margin:0">AI 对我的了解</h2>
+      <div class="spacer"></div>
+      <button class="ghost" id="btnCloseProfile">关闭</button>
+    </div>
+    <div id="profileBody"></div>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -358,6 +373,9 @@ function onServer(ev) {
     enqueueAudio(b64ToBytes(m.pcm));
   } else if (m.type === "correction") {
     addCorrection(m);
+  } else if (m.type === "profile_learned") {
+    const names = (m.facts || []).map(f => f.value).slice(0, 3).join("、");
+    if (names) toast("记住了：" + names, 3200);
   } else if (m.type === "voiceprint_skip") {
     $("sBlocked").textContent = m.blocked_sec + " 秒";
   } else if (m.type === "voiceprint_stuck") {
@@ -534,6 +552,50 @@ $("btnSkip").onclick = () => {
 };
 
 $("btnAgain").onclick = () => location.reload();
+
+$("btnProfile").onclick = async () => {
+  const r = await fetch("/api/profile");
+  const d = await r.json();
+  const box = $("profileBody");
+  if (!d.count) {
+    box.innerHTML = '<p class="hint">还没有积累任何信息。'
+      + '多聊几次后，这里会逐渐记录你的背景和兴趣。</p>';
+  } else {
+    let html = '<p class="hint">共 ' + d.count + ' 条。'
+      + '置信度≥0.6 的会被用于个性化话题。</p>';
+    const cats = {};
+    d.facts.forEach(f => (cats[f.category] = cats[f.category] || []).push(f));
+    const LABEL = {background:"背景", interest:"兴趣", preference:"偏好",
+                   goal:"目标", language:"语言问题", life:"生活"};
+    Object.keys(cats).forEach(k => {
+      html += '<h2 style="margin-top:14px">' + (LABEL[k] || k) + '</h2>';
+      cats[k].forEach(f => {
+        const col = f.confidence >= 0.8 ? "var(--ok)"
+          : f.confidence >= 0.6 ? "var(--warn)" : "var(--dim)";
+        html += '<div class="stat"><span>' + esc(f.value)
+          + '</span><b style="color:' + col + '">'
+          + Math.round(f.confidence * 100) + '%</b></div>';
+      });
+    });
+    if (d.issues && d.issues.length) {
+      html += '<h2 style="margin-top:16px">反复出现的问题</h2>';
+      d.issues.forEach(i => {
+        html += '<div class="corr minor" style="margin-bottom:6px">'
+          + esc(i) + '</div>';
+      });
+    }
+    box.innerHTML = html;
+  }
+  $("profileModal").classList.remove("hidden");
+};
+
+$("btnCloseProfile").onclick = () =>
+  $("profileModal").classList.add("hidden");
+
+$("profileModal").onclick = e => {
+  if (e.target === $("profileModal"))
+    $("profileModal").classList.add("hidden");
+};
 
 $("btnHistory").onclick = async () => {
   const r = await fetch("/api/sessions?limit=20");
