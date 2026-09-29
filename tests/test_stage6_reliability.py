@@ -900,3 +900,60 @@ def test_connection_lost_false_when_deliberately_closing():
 
     s.ended = True
     assert ConversationSession.is_connection_lost(s) is False
+
+
+# ============================================================
+#  HTTPS 启动（手机访问的前置条件）
+# ============================================================
+
+def test_main_supports_https():
+    """
+    启动入口必须真的支持 HTTPS。
+
+    浏览器只在 localhost 或 https 下给麦克风权限，
+    所以手机连电脑练习必须走 HTTPS。
+    文档里一度写着 --ssl-keyfile，但代码根本没实现 ——
+    照着文档做只会启动失败。这个测试防止再出现这种不一致。
+    """
+    import pathlib
+
+    src = pathlib.Path(
+        "./app/__main__.py"
+    ).read_text()
+    assert "--ssl" in src
+    assert "ssl_certfile" in src and "ssl_keyfile" in src
+    assert "uvicorn.run" in src
+
+
+def test_main_reports_missing_cert_clearly():
+    """
+    证书缺失要给出可操作的提示，而不是抛一堆堆栈。
+    """
+    import pathlib
+
+    src = pathlib.Path(
+        "./app/__main__.py"
+    ).read_text()
+    assert "make_cert.py" in src, "要告诉用户怎么生成证书"
+
+
+def test_docs_match_reality():
+    """
+    文档里的启动命令必须和代码一致。
+
+    这是踩过的坑：使用说明里写了 --ssl-keyfile，
+    但 app/__main__.py 当时只有 --host/--port/--reload，
+    照文档做会直接启动失败。
+    """
+    import pathlib
+
+    doc = pathlib.Path(
+        "./docs/使用说明.md"
+    ).read_text()
+    code = pathlib.Path(
+        "./app/__main__.py"
+    ).read_text()
+
+    for flag in ("--ssl", "--host"):
+        if flag in doc:
+            assert flag in code, f"文档提到 {flag}，但代码没实现"
