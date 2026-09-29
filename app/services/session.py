@@ -89,6 +89,17 @@ class ConversationSession:
         self.rt = RealtimeSession(self.s, instructions=self.instructions,
                                   on_event=self._on_qwen_event)
         await self.rt.connect()
+
+        # 让 AI 主动开场。Realtime API 自己不会先说话，
+        # 不显式触发的话用户会对着沉默等待。
+        try:
+            await self.rt.request_response(
+                "Greet the student warmly in one or two sentences, "
+                "briefly introduce today's topic, then ask them one open "
+                "question to get them talking. Keep it short.")
+        except Exception as e:
+            log.warning("开场触发失败: %s", e)
+
         await self.on_client({
             "type": "ready",
             "model": self.s.qwen_model,

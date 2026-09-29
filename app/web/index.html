@@ -1,1 +1,565 @@
-<!doctype html><title>英语口语陪练</title><p>界面开发中
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>英语口语陪练</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+  --fg:#e6e9ef; --dim:#8b93a7; --accent:#4c9aff; --ok:#3ecf8e;
+  --warn:#f5a623; --err:#ff5c5c;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:15px/1.6 -apple-system,"PingFang SC","Helvetica Neue",sans-serif}
+button{font:inherit;cursor:pointer;border:0;border-radius:8px;
+  padding:10px 18px;background:var(--accent);color:#fff;transition:.15s}
+button:hover{filter:brightness(1.1)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--line)}
+input,textarea{font:inherit;background:var(--panel2);color:var(--fg);
+  border:1px solid var(--line);border-radius:8px;padding:10px 12px;width:100%}
+input:focus,textarea:focus{outline:none;border-color:var(--accent)}
+
+.wrap{max-width:1280px;margin:0 auto;padding:18px}
+header{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+h1{font-size:19px;margin:0;font-weight:600}
+.spacer{flex:1}
+.pill{font-size:12px;padding:3px 10px;border-radius:20px;
+  background:var(--panel2);border:1px solid var(--line);color:var(--dim)}
+.pill.on{color:var(--ok);border-color:#26543c}
+.pill.off{color:var(--err);border-color:#5a2b2b}
+
+.cols{display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start}
+@media(max-width:900px){.cols{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;padding:16px}
+.card h2{font-size:14px;margin:0 0 12px;color:var(--dim);
+  font-weight:600;letter-spacing:.03em}
+
+#log{height:430px;overflow-y:auto;display:flex;flex-direction:column;gap:12px;
+  padding:4px 2px}
+.msg{max-width:88%;padding:10px 14px;border-radius:12px;
+  animation:in .18s ease-out}
+@keyframes in{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
+.msg.user{align-self:flex-end;background:#1c3251;border:1px solid #2b4a72}
+.msg.ai{align-self:flex-start;background:#16301f;border:1px solid #24503a}
+.msg .who{font-size:11px;color:var(--dim);margin-bottom:3px}
+.msg .txt{white-space:pre-wrap;word-break:break-word}
+.msg.partial{opacity:.62}
+
+#bar{height:4px;background:var(--panel2);border-radius:2px;
+  overflow:hidden;margin:12px 0 10px}
+#barfill{height:100%;width:100%;background:var(--accent);transition:width .6s linear}
+#barfill.low{background:var(--warn)}
+#barfill.crit{background:var(--err)}
+
+.ctrls{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.meter{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--dim)}
+.dot{width:9px;height:9px;border-radius:50%;background:#3a4152}
+.dot.live{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+
+#corrections{display:flex;flex-direction:column;gap:10px;
+  max-height:330px;overflow-y:auto}
+.corr{background:var(--panel2);border-left:3px solid var(--dim);
+  border-radius:6px;padding:9px 11px;font-size:13px;
+  animation:in .25s ease-out}
+.corr.critical{border-left-color:var(--err)}
+.corr.minor{border-left-color:var(--warn)}
+.corr .tag{font-size:10px;color:var(--dim);letter-spacing:.05em}
+.corr .from{color:#ff9d9d;text-decoration:line-through}
+.corr .to{color:#8ef0bb}
+.corr .why{color:var(--dim);font-size:12px;margin-top:3px}
+
+.stat{display:flex;justify-content:space-between;padding:5px 0;
+  border-bottom:1px solid var(--line);font-size:13px}
+.stat:last-child{border:0}
+.stat b{font-weight:600}
+#plan li{margin-bottom:8px;font-size:13px;color:var(--dim)}
+#plan li b{color:var(--fg);font-weight:500;display:block}
+#planLive li{margin-bottom:8px;font-size:13px;color:var(--dim)}
+#planLive li b{color:var(--fg);font-weight:500;display:block}
+
+.hidden{display:none!important}
+#toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);
+  background:var(--panel2);border:1px solid var(--line);padding:10px 18px;
+  border-radius:10px;font-size:13px;opacity:0;transition:.25s;
+  pointer-events:none;z-index:99;max-width:80vw}
+#toast.show{opacity:1}
+.hint{font-size:12px;color:var(--dim);margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>英语口语陪练</h1>
+    <span class="pill" id="pModel">—</span>
+    <span class="pill" id="pVoice">—</span>
+    <span class="pill" id="pVp">—</span>
+    <div class="spacer"></div>
+    <button class="ghost" id="btnHistory">历史</button>
+  </header>
+
+  <section id="setup">
+    <div class="card">
+      <h2>今天想聊什么</h2>
+      <textarea id="input" rows="5"
+        placeholder="粘贴一个主题、一段话、一篇文章，或一个网址…&#10;&#10;例如：&#10;· 聊一聊人工智能对就业的影响&#10;· https://en.wikipedia.org/wiki/Remote_work&#10;· 直接粘贴一段英文文章"></textarea>
+      <div class="ctrls" style="margin-top:12px">
+        <button id="btnPrepare">生成话题</button>
+        <label class="meter"><input type="checkbox" id="optVp" checked
+          style="width:auto"> 只回应我的声音</label>
+        <div class="spacer"></div>
+        <span class="hint" id="setupHint"></span>
+      </div>
+    </div>
+
+    <div class="card hidden" id="planCard" style="margin-top:16px">
+      <h2>备课结果</h2>
+      <div id="plan"></div>
+      <div class="ctrls" style="margin-top:14px">
+        <button id="btnStart">开始练习</button>
+        <button class="ghost" id="btnReprepare">换个话题</button>
+      </div>
+      <div class="hint">提示：开始后请允许麦克风权限。手机访问需用 https。</div>
+    </div>
+  </section>
+
+  <section id="during" class="hidden">
+    <div class="cols">
+      <div>
+        <div class="card">
+          <div class="ctrls" style="margin-bottom:10px">
+            <div class="meter"><span class="dot" id="dMic"></span>麦克风</div>
+            <div class="meter"><span class="dot" id="dAi"></span>AI 说话</div>
+            <div class="spacer"></div>
+            <span class="pill" id="pTime">30:00</span>
+          </div>
+          <div id="bar"><div id="barfill"></div></div>
+          <div id="log"></div>
+          <div class="ctrls" style="margin-top:12px">
+            <button id="btnStop" class="ghost">结束练习</button>
+            <button id="btnSkip" class="ghost">换个话题</button>
+            <div class="spacer"></div>
+            <span class="hint" id="duringHint"></span>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2>实时纠错</h2>
+          <div id="corrections">
+            <div class="hint">开始说话后，这里会显示值得注意的地方。</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <h2>本次数据</h2>
+          <div class="stat"><span>已进行</span><b id="sTime">0:00</b></div>
+          <div class="stat"><span>我说话</span><b id="sMe">0 字</b></div>
+          <div class="stat"><span>AI 说话</span><b id="sAi">0 字</b></div>
+          <div class="stat"><span>我占比</span><b id="sRatio">—</b></div>
+          <div class="stat"><span>过滤掉旁人/噪音</span><b id="sBlocked">0 秒</b></div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <h2>今天的话题</h2>
+          <div id="planLive"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="report" class="hidden">
+    <div class="card">
+      <h2>练习报告</h2>
+      <div id="reportBody"></div>
+      <div class="ctrls" style="margin-top:16px">
+        <button id="btnAgain">再练一次</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const IN_RATE = 16000, OUT_RATE = 24000;
+const $ = id => document.getElementById(id);
+
+let ws = null, micStream = null, worklet = null, srcNode = null;
+let ctxIn = null, ctxOut = null, playHead = 0;
+let running = false, prepared = null, reportShown = false;
+
+function toast(msg, ms = 2600) {
+  const t = $("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove("show"), ms);
+}
+function b64ToBytes(b64) {
+  const bin = atob(b64), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function fmt(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+}
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+
+function addMsg(who, text) {
+  const log = $("log");
+  const el = document.createElement("div");
+  el.className = "msg " + who;
+  el.innerHTML = '<div class="who">' + (who === "user" ? "我" : "AI")
+    + '</div><div class="txt"></div>';
+  el.querySelector(".txt").textContent = text;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+}
+
+const KIND_CN = { grammar: "语法", vocabulary: "表达",
+                  pronunciation: "发音", fluency: "流畅度" };
+function renderCorr(c, into) {
+  const el = document.createElement("div");
+  el.className = "corr " + c.severity;
+  el.innerHTML = '<div class="tag">' + (KIND_CN[c.kind] || c.kind)
+    + (c.word ? " · " + esc(c.word) : "") + '</div>'
+    + '<div><span class="from">' + esc(c.original) + '</span> → '
+    + '<span class="to">' + esc(c.suggestion) + '</span></div>'
+    + (c.explanation ? '<div class="why">' + esc(c.explanation) + '</div>' : '');
+  into.appendChild(el);
+}
+function addCorrection(c) {
+  const box = $("corrections");
+  const h = box.querySelector(".hint");
+  if (h) h.remove();
+  renderCorr(c, box);
+  box.scrollTop = 0;
+}
+
+function enqueueAudio(bytes) {
+  if (!ctxOut) return;
+  const i16 = new Int16Array(bytes.buffer, bytes.byteOffset,
+                             bytes.byteLength >> 1);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  const buf = ctxOut.createBuffer(1, f32.length, OUT_RATE);
+  buf.copyToChannel(f32, 0);
+  if (playHead < ctxOut.currentTime) playHead = ctxOut.currentTime + 0.02;
+  const src = ctxOut.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctxOut.destination);
+  src.start(playHead);
+  playHead += buf.duration;
+}
+
+function stopPlayback() {
+  playHead = 0;
+  if (ctxOut) {
+    try { ctxOut.close(); } catch (e) {}
+    ctxOut = new AudioContext({ sampleRate: OUT_RATE });
+  }
+}
+
+async function startMic() {
+  // 三项处理全开：
+  //  echoCancellation 关 → AI 听见自己 → 自问自答
+  //  autoGainControl 关 → 音量过低 → VAD 不触发 → 感觉变慢
+  //  noiseSuppression 是唯一影响声纹的一项，实测影响很小
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true,
+             autoGainControl: true, channelCount: 1 }
+  });
+
+  ctxIn = new AudioContext({ sampleRate: IN_RATE });
+  if (ctxIn.state === "suspended") await ctxIn.resume();
+  const ratio = ctxIn.sampleRate / IN_RATE;
+
+  const code = 'class PCM extends AudioWorkletProcessor {'
+    + 'process(inputs){const ch=inputs[0]&&inputs[0][0];'
+    + 'if(ch&&ch.length)this.port.postMessage(ch.slice(0));return true;}}'
+    + 'registerProcessor("pcm",PCM);';
+  const url = URL.createObjectURL(
+    new Blob([code], { type: "application/javascript" }));
+  await ctxIn.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  worklet = new AudioWorkletNode(ctxIn, "pcm");
+  worklet.port.onmessage = e => {
+    if (!running || !ws || ws.readyState !== 1) return;
+    let f32 = e.data;
+    if (Math.abs(ratio - 1) > 1e-6) {
+      const n = Math.floor(f32.length / ratio);
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = f32[Math.floor(i * ratio)];
+      f32 = out;
+    }
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const v = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = v < 0 ? v * 32768 : v * 32767;
+    }
+    ws.send(i16.buffer);
+  };
+
+  srcNode = ctxIn.createMediaStreamSource(micStream);
+  srcNode.connect(worklet);
+  // 故意不接 destination，避免把自己的声音放出来形成回授
+}
+
+function connect(content) {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const vp = $("optVp").checked ? "1" : "0";
+  ws = new WebSocket(proto + "://" + location.host + "/ws/session"
+    + "?content=" + encodeURIComponent(content) + "&voiceprint=" + vp);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = onServer;
+  ws.onclose = () => {
+    if (running && !reportShown) { toast("连接已断开"); cleanup(); }
+  };
+  ws.onerror = () => toast("连接出错，请检查网络与密钥配置");
+}
+
+function onServer(ev) {
+  if (typeof ev.data !== "string") return;
+  let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+
+  if (m.type === "status" && m.stage === "planning") {
+    $("duringHint").textContent = "正在分析内容、准备话题…";
+  } else if (m.type === "plan") {
+    prepared = m.plan;
+    renderPlan();
+    $("duringHint").textContent = "";
+  } else if (m.type === "session") {
+    running = true;
+    $("pTime").textContent = fmt(m.minutes * 60);
+  } else if (m.type === "ready") {
+    $("pVoice").textContent = m.voice || "语音就绪";
+    $("pVoice").className = "pill on";
+    $("pVp").textContent = m.voiceprint ? "声纹已启用" : "声纹关闭";
+    $("pVp").className = "pill " + (m.voiceprint ? "on" : "off");
+  } else if (m.type === "user_speaking") {
+    $("dAi").classList.remove("live");
+    stopPlayback();
+  } else if (m.type === "user_text") {
+    addMsg("user", m.text);
+  } else if (m.type === "ai_text") {
+    addMsg("ai", m.text);
+  } else if (m.type === "audio") {
+    $("dAi").classList.add("live");
+    enqueueAudio(b64ToBytes(m.pcm));
+  } else if (m.type === "correction") {
+    addCorrection(m);
+  } else if (m.type === "voiceprint_skip") {
+    $("sBlocked").textContent = m.blocked_sec + " 秒";
+  } else if (m.type === "voiceprint_stuck") {
+    toast("声纹暂时无法判断，已先放行", 3000);
+  } else if (m.type === "tick") {
+    updateStats(m);
+  } else if (m.type === "time_up") {
+    toast("时间到，正在生成报告…");
+    reportShown = true;
+  } else if (m.type === "error") {
+    const e = m.error;
+    toast("出错了：" + ((e && (e.message || e.code)) || e || "未知错误"), 5000);
+  } else if (m.type === "finished") {
+    reportShown = true;
+    showReport(m.report);
+  }
+}
+
+function renderPlan() {
+  const p = prepared || {};
+  const box = $("plan");
+  box.innerHTML = "";
+  if (p.background) {
+    const d = document.createElement("p");
+    d.style.cssText = "color:var(--dim);font-size:13px";
+    d.textContent = p.background;
+    box.appendChild(d);
+  }
+  const ul = document.createElement("ul");
+  ul.style.paddingLeft = "18px";
+  (p.topics || []).forEach(t => {
+    const li = document.createElement("li");
+    const b = document.createElement("b");
+    b.textContent = t.prompt;
+    li.appendChild(b);
+    if (t.title) li.appendChild(document.createTextNode(t.title));
+    ul.appendChild(li);
+  });
+  box.appendChild(ul);
+  $("planLive").innerHTML = ul.outerHTML;
+}
+
+function updateStats(m) {
+  $("sTime").textContent = fmt(m.elapsed_sec);
+  $("pTime").textContent = fmt(m.remaining_sec);
+  $("sMe").textContent = m.user_chars + " 字";
+  $("sAi").textContent = m.ai_chars + " 字";
+  const total = m.user_chars + m.ai_chars;
+  if (total) {
+    const r = Math.round(m.user_chars / total * 100);
+    $("sRatio").textContent = r + "%";
+    $("sRatio").style.color = r >= 55 ? "var(--ok)"
+      : r >= 40 ? "var(--warn)" : "var(--err)";
+  }
+  if (m.blocked_sec) $("sBlocked").textContent = m.blocked_sec + " 秒";
+
+  const frac = Math.max(0, Math.min(1, m.remaining_sec / (30 * 60)));
+  const bar = $("barfill");
+  bar.style.width = (frac * 100) + "%";
+  bar.className = frac < 0.1 ? "crit" : frac < 0.3 ? "low" : "";
+}
+
+function cleanup() {
+  running = false;
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (srcNode) { try { srcNode.disconnect(); } catch (e) {} srcNode = null; }
+  if (worklet) { try { worklet.disconnect(); } catch (e) {} worklet = null; }
+  if (ctxIn) { try { ctxIn.close(); } catch (e) {} ctxIn = null; }
+  if (ctxOut) { try { ctxOut.close(); } catch (e) {} ctxOut = null; }
+  $("dMic").classList.remove("live");
+  $("dAi").classList.remove("live");
+}
+
+function showReport(r) {
+  cleanup();
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  $("during").classList.add("hidden");
+  $("report").classList.remove("hidden");
+  if (!r) { $("reportBody").textContent = "（报告不可用）"; return; }
+
+  const ratio = Math.round((r.user_ratio || 0) * 100);
+  let html =
+    '<div class="stat"><span>时长</span><b>' + fmt(r.duration_sec) + '</b></div>'
+    + '<div class="stat"><span>我说话</span><b>' + (r.user_char_count || 0)
+    + ' 字</b></div>'
+    + '<div class="stat"><span>AI 说话</span><b>' + (r.ai_char_count || 0)
+    + ' 字</b></div>'
+    + '<div class="stat"><span>我占比</span><b style="color:'
+    + (ratio >= 55 ? "var(--ok)" : ratio >= 40 ? "var(--warn)" : "var(--err)")
+    + '">' + ratio + '%</b></div>';
+
+  if (ratio < 40) {
+    html += '<p class="hint">这次 AI 说得偏多。下次可以就一个话题多说几句。</p>';
+  }
+
+  const cs = r.corrections || [];
+  if (cs.length) {
+    html += '<h2 style="margin-top:20px">值得注意的地方（' + cs.length
+      + '）</h2><div id="repCorr"></div>';
+  } else {
+    html += '<p class="hint" style="margin-top:16px">这次没有需要纠正的地方。</p>';
+  }
+  $("reportBody").innerHTML = html;
+  if (cs.length) {
+    const box = $("repCorr");
+    cs.forEach(c => renderCorr(c, box));
+  }
+}
+
+$("btnPrepare").onclick = async () => {
+  const content = ($("input").value || "").trim();
+  if (!content) { toast("请先输入内容"); return; }
+  $("btnPrepare").disabled = true;
+  $("setupHint").textContent = "分析中…";
+  try {
+    const r = await fetch("/api/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: content, topics: 5 })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "处理失败");
+    prepared = d.plan;
+    renderPlan();
+    $("planCard").classList.remove("hidden");
+    $("setupHint").textContent = d.kind === "url"
+      ? "已抓取网页正文（" + d.chars + " 字符）" : "";
+  } catch (e) {
+    $("setupHint").textContent = "";
+    toast("生成失败：" + e.message, 5000);
+  } finally {
+    $("btnPrepare").disabled = false;
+  }
+};
+
+$("btnStart").onclick = async () => {
+  const content = ($("input").value || "").trim();
+  if (!content) { toast("请先输入内容"); return; }
+  $("btnStart").disabled = true;
+  $("setup").classList.add("hidden");
+  $("during").classList.remove("hidden");
+  $("duringHint").textContent = "正在连接…";
+  try {
+    ctxOut = new AudioContext({ sampleRate: OUT_RATE });
+    await startMic();
+    $("dMic").classList.add("live");
+    connect(content);
+  } catch (e) {
+    toast("无法访问麦克风：" + e.message, 5000);
+    $("duringHint").textContent = "麦克风不可用";
+    $("btnStart").disabled = false;
+    $("setup").classList.remove("hidden");
+    $("during").classList.add("hidden");
+  }
+};
+
+$("btnReprepare").onclick = () => {
+  $("planCard").classList.add("hidden");
+  $("input").focus();
+};
+
+$("btnStop").onclick = () => {
+  if (!confirm("确定结束本次练习？")) return;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "stop" }));
+  else showReport(null);
+};
+
+$("btnSkip").onclick = () => {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: "text",
+      text: "Let's move on to the next topic." }));
+    toast("已请求换个话题");
+  }
+};
+
+$("btnAgain").onclick = () => location.reload();
+
+$("btnHistory").onclick = async () => {
+  const r = await fetch("/api/sessions?limit=20");
+  const d = await r.json();
+  if (!d.sessions || !d.sessions.length) { toast("还没有练习记录"); return; }
+  const lines = d.sessions.map(s => "#" + s.id + "  "
+    + String(s.started_at || "").slice(5, 16) + "  "
+    + (s.duration_sec ? fmt(s.duration_sec) : "—") + "  "
+    + (s.turn_count || 0) + "轮  " + String(s.title || "").slice(0, 30));
+  alert("最近的练习：\n\n" + lines.join("\n"));
+};
+
+fetch("/api/health").then(r => r.json()).then(h => {
+  $("pModel").textContent = h.model || "—";
+  $("pVoice").textContent = h.voice_ready ? "语音就绪" : "缺少语音密钥";
+  $("pVoice").className = "pill " + (h.voice_ready ? "on" : "off");
+  $("pVp").textContent = h.voiceprint ? "声纹可用" : "无声纹档案";
+  $("pVp").className = "pill " + (h.voiceprint ? "on" : "off");
+  $("optVp").checked = !!h.voiceprint;
+}).catch(() => {});
+
+window.addEventListener("beforeunload", () => {
+  if (running && ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: "stop" }));
+  }
+});
+</script>
+</body>
+</html>

@@ -389,3 +389,80 @@ async def test_stop_is_idempotent(db, monkeypatch):
     await sess.stop()
     await sess.stop()          # 第二次不应报错
     assert fake.closed
+
+
+# ============================================================
+#  阶段 4 回归：开场白与关闭
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_start_triggers_opening(db, monkeypatch):
+    """回归：Realtime API 不会自己先说话，必须显式触发开场。
+
+    不触发的话，用户连上后对着沉默等待，以为坏了。
+    """
+    sess, fake, _, sid = make_session(db, None, monkeypatch=monkeypatch)
+
+    called = {"n": 0}
+
+    async def fake_request(instructions=None):
+        called["n"] += 1
+        called["ins"] = instructions
+
+    fake.request_response = fake_request
+    await sess.start()
+
+    assert called["n"] == 1, "start() 必须触发一次开场"
+    assert called.get("ins"), "开场指令不应为空"
+
+
+@pytest.mark.asyncio
+async def test_ready_sent_after_opening(db, monkeypatch):
+    """ready 要在触发开场之后发，前端才知道可以开始了。"""
+    sess, fake, msgs, sid = make_session(db, None, monkeypatch=monkeypatch)
+
+    async def fake_request(instructions=None):
+        pass
+
+    fake.request_response = fake_request
+    await sess.start()
+    assert any(m["type"] == "ready" for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_close_is_bounded(db, monkeypatch):
+    """回归：ws.close() 会挂住（实测 >8s），必须限时不阻塞收尾。
+
+    否则会话结束后报告发不出去，前端一直转圈。
+    """
+    import time
+    from app.core.realtime import RealtimeSession as RT
+
+    class HangingWS:
+        """模拟一个 close() 永不返回的连接。"""
+        async def close(self):
+            await asyncio.sleep(3600)
+        transport = None
+
+    rt = RT.__new__(RT)
+    rt.closed = False
+    rt._recv_task = None
+    rt.ws = HangingWS()
+
+    t0 = time.time()
+    await rt.close(timeout=0.5)
+    elapsed = time.time() - t0
+
+    assert elapsed < 3, f"close() 应在限时内返回，实际 {elapsed:.1f}s"
+    assert rt.ws is None
+
+
+@pytest.mark.asyncio
+async def test_close_is_safe_without_connection(db, monkeypatch):
+    """未连接时 close() 不应报错。"""
+    from app.core.realtime import RealtimeSession as RT
+    rt = RT.__new__(RT)
+    rt.closed = False
+    rt._recv_task = None
+    rt.ws = None
+    await rt.close()      # 不应抛出

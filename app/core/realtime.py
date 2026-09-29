@@ -129,6 +129,18 @@ class RealtimeSession:
         """打断 AI 当前回复（用户抢话时用）。"""
         await self._send({"type": "response.cancel"})
 
+    async def request_response(self, instructions: Optional[str] = None) -> None:
+        """
+        主动要求模型开口。
+
+        Realtime API 不会自己先说话 —— 必须显式触发，
+        否则开场白永远不会出现，用户对着沉默发呆。
+        """
+        msg: dict[str, Any] = {"type": "response.create"}
+        if instructions:
+            msg["response"] = {"instructions": instructions}
+        await self._send(msg)
+
     async def _recv_loop(self) -> None:
         try:
             async for raw in self.ws:
@@ -167,19 +179,38 @@ class RealtimeSession:
 
     # ---------- 关闭 ----------
 
-    async def close(self) -> None:
+    async def close(self, timeout: float = 5.0) -> None:
+        """
+        关闭连接。
+
+        注意：ws.close() 会挂住（实测 >8s 不返回）——
+        它要等对端回 close 帧，而对端此时可能已经不理我们了。
+        所以必须限时，超时就强制断开，否则整个会话收不了尾、
+        报告发不出去、前端一直转圈。
+        """
         self.closed = True
+
         if self._recv_task:
             self._recv_task.cancel()
             try:
-                await self._recv_task
-            except (asyncio.CancelledError, Exception):
+                await asyncio.wait_for(self._recv_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
+            self._recv_task = None
+
         if self.ws:
             try:
-                await self.ws.close()
-            except Exception:
-                pass
+                await asyncio.wait_for(self.ws.close(), timeout=timeout)
+            except (asyncio.TimeoutError, Exception):
+                # 优雅关闭失败 → 直接掐断底层连接
+                log.debug("ws.close() 超时，强制断开")
+                transport = getattr(self.ws, "transport", None)
+                if transport is not None:
+                    try:
+                        transport.abort()
+                    except Exception:
+                        pass
+            self.ws = None
 
     async def __aenter__(self) -> "RealtimeSession":
         await self.connect()
