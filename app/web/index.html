@@ -209,6 +209,7 @@ let ws = null, micStream = null, worklet = null, srcNode = null;
 let ctxIn = null, ctxOut = null, playHead = 0;
 let running = false, prepared = null, reportShown = false;
 let lastContent = "", dropped = false, elapsedBefore = 0, reconnects = 0;
+let aborted = false;
 
 function toast(msg, ms = 2600) {
   const t = $("toast");
@@ -339,7 +340,7 @@ function connect(content) {
   ws.binaryType = "arraybuffer";
   ws.onmessage = onServer;
   ws.onclose = (ev) => {
-    if (!running || reportShown) return;
+    if (!running || reportShown || aborted) return;
     dropped = true;
     cleanup();
     // 明确告知，不假装没事：断线后 AI 的上下文已经没了，
@@ -394,6 +395,11 @@ function onServer(ev) {
   } else if (m.type === "time_up") {
     toast("时间到，正在生成报告…");
     reportShown = true;
+  } else if (m.type === "aborted") {
+    // 服务端主动结束了会话（如长时间没听到说话）。
+    // 如实告知原因，并保留已有记录。
+    aborted = true;
+    showAborted(m.reason, m.message);
   } else if (m.type === "error") {
     const e = m.error;
     toast("出错了：" + ((e && (e.message || e.code)) || e || "未知错误"), 5000);
@@ -458,6 +464,37 @@ function cleanup() {
   $("dMic").classList.remove("live");
   $("dAi").classList.remove("live");
   dropped = keep;
+}
+
+function showAborted(reason, message) {
+  running = false;
+  cleanup();
+  const box = document.createElement("div");
+  box.className = "card";
+  box.style.cssText = "margin-top:14px;border-color:#5a4226";
+  box.innerHTML =
+    '<h2 style="color:var(--warn)">练习已中断</h2>'
+    + '<p class="hint" style="font-size:13px">'
+    + esc(message || reason || "服务端结束了会话")
+    + '<br>刚才的记录都已保存，可以在「历史」里查看。</p>'
+    + '<div class="ctrls" style="margin-top:12px">'
+    + '<button id="btnRestart">重新开始</button>'
+    + '<button class="ghost" id="btnSeeReport">看报告</button>'
+    + '</div>';
+  const host = $("during").querySelector(".card");
+  const old = box.parentElement && $("abortBox");
+  if ($("abortBox")) $("abortBox").remove();
+  box.id = "abortBox";
+  host.parentElement.appendChild(box);
+  $("btnRestart").onclick = () => location.reload();
+  $("btnSeeReport").onclick = () => {
+    showReport(null);
+    $("report").classList.remove("hidden");
+    $("reportBody").innerHTML =
+      '<p class="hint">练习中断，无法生成完整报告。'
+      + '但记录已保存，可在「历史」中查看。</p>';
+  };
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
 }
 
 function showDropped(code) {

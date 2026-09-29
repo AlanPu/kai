@@ -188,3 +188,108 @@ def test_soak_uses_real_speech():
            / "scripts" / "soak_test.py").read_text(encoding="utf-8")
     assert "sample_speech" in src
     assert "speech_like" not in src, "不该再用合成音"
+
+
+# ============================================================
+#  致命错误处理（30 分钟稳定性测试的真实发现）
+# ============================================================
+
+def test_fatal_error_detection():
+    """
+    回归：30 分钟稳定性测试暴露的真实问题。
+
+    Qwen 在长时间没有「被识别为用户说话」的音频后，
+    会直接关闭会话（user_idle_timeout，300 秒）。
+    但客户端一直在发音频字节，所以程序不知道连接已经死了。
+
+    最初的表现：报错后服务器又空转 24 分钟，
+    用户对着一个死连接说话，以为还在练。
+    """
+    from app.core.realtime import is_fatal_error
+    assert is_fatal_error("user_idle_timeout")
+    assert is_fatal_error("session_expired")
+    assert is_fatal_error("invalid_api_key")
+    assert is_fatal_error("insufficient_quota")
+    assert is_fatal_error("connection_closed")
+
+
+def test_non_fatal_errors_do_not_end_session():
+    """这些错误只影响一次回复，不该终止整场对话。"""
+    from app.core.realtime import is_fatal_error
+    assert not is_fatal_error("content_filter")
+    assert not is_fatal_error("response_failed")
+    assert not is_fatal_error("")
+    assert not is_fatal_error(None)
+
+
+def test_session_fatal_defined_in_core():
+    """
+    分层：SessionFatal 必须定义在 core。
+
+    它最初定义在 services，然后 core.realtime 反过来导入它 ——
+    底层依赖上层，会形成循环，只是碰巧导入顺序对才没炸。
+    """
+    from app.core.realtime import SessionFatal
+    assert SessionFatal.__module__ == "app.core.realtime"
+
+
+@pytest.mark.asyncio
+async def test_fatal_error_raises_and_marks():
+    """收到致命错误必须抛出，并记下原因。"""
+    from app.core.realtime import SessionFatal
+    from app.services.session import ConversationSession, SessionStats
+
+    sent = []
+
+    async def on_client(m):
+        sent.append(m)
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.on_client = on_client
+    s.ended = False
+    s.verifier = None
+    s.stats = SessionStats()
+    s.fatal_error = None
+    s._model_speaking = False
+
+    with pytest.raises(SessionFatal):
+        await ConversationSession._on_qwen_event(
+            s, {"type": "error",
+                "error": {"code": "user_idle_timeout"}})
+
+    assert s.fatal_error == "user_idle_timeout"
+    assert any(m["type"] == "error" for m in sent), "要先告知客户端"
+
+
+@pytest.mark.asyncio
+async def test_non_fatal_error_continues():
+    """非致命错误不应打断对话。"""
+    from app.services.session import ConversationSession, SessionStats
+
+    async def on_client(m):
+        pass
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.on_client = on_client
+    s.ended = False
+    s.verifier = None
+    s.stats = SessionStats()
+    s.fatal_error = None
+    s._model_speaking = False
+
+    # 不应抛出
+    await ConversationSession._on_qwen_event(
+        s, {"type": "error", "error": {"code": "content_filter"}})
+    assert s.fatal_error is None
+
+
+def test_fatal_message_is_human_readable():
+    """错误码要翻译成人话，不能把 code 直接丢给用户看。"""
+    from app.api.server import _fatal_message
+    idle = _fatal_message("user_idle_timeout")
+    assert "说话" in idle, "要说明原因"
+    assert "报告" in idle, "要告诉用户已有内容还在"
+    assert _fatal_message("invalid_api_key")
+    assert _fatal_message("insufficient_quota")
+    # 未知错误也要能给出可读文本
+    assert _fatal_message("some_unknown_thing")

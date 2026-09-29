@@ -399,6 +399,23 @@ async def _recv_loop(ws: WebSocket, sess: ConversationSession) -> None:
             await _handle_cmd(cmd, sess)
 
 
+def _fatal_message(code: str) -> str:
+    """把服务端的错误码翻译成用户能懂的话。"""
+    c = (code or "").lower()
+    if "idle" in c:
+        return ("很久没有听到你说话了，服务端已关闭本次会话。"
+                "录音还在，可以接着看报告；想继续就重新开始一次。")
+    if "quota" in c or "insufficient" in c:
+        return "账户额度不足，本次会话已中断。"
+    if "api_key" in c or "auth" in c:
+        return "密钥无效或已过期，请检查 .env 配置。"
+    if "rate" in c:
+        return "请求过于频繁，被限流了，稍后再试。"
+    if "expired" in c or "closed" in c:
+        return "会话已过期或被服务端关闭，请重新开始。"
+    return f"会话被服务端中断（{code}），请重新开始。"
+
+
 class _StopRequested(Exception):
     """用户主动结束会话。用专门的异常，不复用 WebSocketDisconnect
     （后者语义是"连接意外断开"，拿来当控制流会掩盖真实错误）。"""

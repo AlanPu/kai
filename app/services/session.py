@@ -18,9 +18,9 @@ import numpy as np
 
 from ..core.audio import rms
 from ..core.config import Settings
-from ..core.realtime import (RealtimeSession, extract_ai_text,
+from ..core.realtime import (RealtimeSession, SessionFatal, extract_ai_text,
                              extract_audio_delta, extract_transcript,
-                             is_speech_started)
+                             is_fatal_error, is_speech_started)
 from ..core.voiceprint import SpeakerVerifier
 from ..storage.db import Database
 from ..storage.models import Correction, Turn
@@ -28,6 +28,8 @@ from .corrector import Corrector
 from .profile import ProfileExtractor, ProfileStore
 
 log = logging.getLogger(__name__)
+
+
 
 SendToClient = Callable[[dict], Awaitable[None]]
 
@@ -78,6 +80,7 @@ class ConversationSession:
         self._extract_threshold = 5
 
         self.stats = SessionStats()
+        self.fatal_error: Optional[str] = None
         self.started_at = time.time()
         self.duration_limit = (minutes or settings.session_minutes) * 60
 
@@ -222,7 +225,17 @@ class ConversationSession:
         t = ev.get("type", "")
 
         if t == "error":
-            await self.on_client({"type": "error", "error": ev.get("error")})
+            err = ev.get("error") or {}
+            code = str(err.get("code") or err.get("type") or "")
+            await self.on_client({"type": "error", "error": err})
+            if is_fatal_error(code):
+                # 服务端已经关掉会话了。必须如实结束，
+                # 否则会继续假装正常运行 —— 实测见过报错后
+                # 又空转 24 分钟，用户对着一个死连接说话。
+                log.warning("会话致命错误，主动结束: %s", code)
+                self.fatal_error = code
+                # 抛出以终止 recv 循环，让上层走正常收尾
+                raise SessionFatal(code)
             return
 
         audio = extract_audio_delta(ev)

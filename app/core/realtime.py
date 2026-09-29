@@ -24,6 +24,34 @@ from .llm import LLMError
 
 log = logging.getLogger(__name__)
 
+
+class SessionFatal(Exception):
+    """
+    服务端已判定会话不可继续（如长时间无有效输入）。
+
+    定义在 core 而不是 services —— core 是底层模块，
+    反过来依赖 services 会形成循环，且违反分层。
+    """
+
+
+# 这些错误意味着连接已经没用了，继续等只是浪费时间
+FATAL_CODES = {
+    "user_idle_timeout",     # 用户长时间没说话，服务端关闭
+    "session_expired",
+    "session_closed",
+    "connection_closed",
+    "internal_error",
+    "invalid_api_key",
+    "insufficient_quota",
+    "rate_limit_exceeded",
+    "invalid_request_error",
+}
+
+
+def is_fatal_error(code) -> bool:
+    c = str(code or "").lower()
+    return any(f in c for f in FATAL_CODES)
+
 # 事件处理器：收到事件时调用，可 await
 EventHandler = Callable[[dict], Awaitable[None]]
 
@@ -152,6 +180,10 @@ class RealtimeSession:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            # 致命错误要冒泡出去，让上层知道会话已经不可用。
+            # 全部吞掉的话，连接死了上层还在傻等。
+            if isinstance(e, SessionFatal):
+                raise
             if not self.closed:
                 log.warning("接收循环结束: %s", e)
                 self._last_error = str(e)
