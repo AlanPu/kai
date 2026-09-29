@@ -683,3 +683,220 @@ async def test_stop_survives_close_failure():
     await ConversationSession.stop(s)      # 不该抛出
     assert s.ended is True
     assert closed, "即使关连接失败，也应当完成收尾落库"
+
+
+# ============================================================
+#  无 type 的错误帧（额度耗尽时服务端就是这么回的）
+# ============================================================
+
+def test_quota_error_is_fatal():
+    """
+    额度问题必须判为致命。
+
+    重连也不会好 —— 判成可恢复的话，程序会反复重连，
+    用户对着一个永远起不来的会话干等。
+    """
+    from app.core.realtime import is_fatal_error, is_quota_error
+
+    assert is_quota_error("AllocationQuota.FreeTierOnly")
+    assert is_fatal_error("AllocationQuota.FreeTierOnly")
+    # 正常错误不能被误判成额度问题
+    assert not is_quota_error("user_idle_timeout")
+    assert not is_quota_error("")
+
+
+@pytest.mark.asyncio
+async def test_error_frame_without_type_is_recognized():
+    """
+    额度耗尽时服务端回的是：
+        {"code": "AllocationQuota.FreeTierOnly", "message": "..."}
+    没有 type 字段，然后直接掐断连接。
+
+    不识别它的话，接收循环只看到「连接意外关闭」，
+    会话被当成正常结束 —— 用户看到「莫名其妙就结束了」，
+    真正的原因一个字都没显示。
+    """
+    from app.core.realtime import RealtimeSession
+
+    seen = []
+
+    async def on_event(ev):
+        seen.append(ev)
+
+    rt = RealtimeSession.__new__(RealtimeSession)
+    rt.on_event = on_event
+    rt._last_error = None
+
+    await RealtimeSession._handle(rt, {
+        "code": "AllocationQuota.FreeTierOnly",
+        "message": "The free quota has been exhausted.",
+    })
+
+    assert seen, "无 type 的错误帧必须被识别并上报"
+    assert seen[0]["type"] == "error"
+    assert seen[0]["error"]["code"] == "AllocationQuota.FreeTierOnly"
+    assert "FreeTierOnly" in rt._last_error
+
+
+@pytest.mark.asyncio
+async def test_normal_frame_still_passes_through():
+    """修完不能误伤正常帧（没有 code/message 的空帧仍应忽略）。"""
+    from app.core.realtime import RealtimeSession
+
+    seen = []
+
+    async def on_event(ev):
+        seen.append(ev)
+
+    rt = RealtimeSession.__new__(RealtimeSession)
+    rt.on_event = on_event
+    rt._last_error = None
+
+    await RealtimeSession._handle(rt, {"type": "session.created"})
+    await RealtimeSession._handle(rt, {"foo": "bar"})
+    # 带 message 但没有 code 的帧也不该被当成错误 ——
+    # 只凭 message 判断会把正常帧误报
+    await RealtimeSession._handle(rt, {"message": "just a note"})
+
+    # 正常帧照常转发（on_event 本来就该收到它们），
+    # 但绝不能凭空造出 type=error
+    kinds = [e.get("type") for e in seen]
+    assert "error" not in kinds, f"不该凭空造出错误: {kinds}"
+    assert kinds == ["session.created", None, None], kinds
+
+
+def test_quota_message_is_actionable():
+    """
+    提示要说清楚「怎么办」。
+
+    只说「额度不足」，用户只能一脸茫然地反复重试 ——
+    免费额度用完后需要去控制台充值或关掉「仅用免费额度」。
+    """
+    import pathlib
+
+    src = pathlib.Path(
+        "./app/api/server.py"
+    ).read_text()
+    i = src.index("语音模型的免费额度用完了")
+    msg = src[i:i + 200]
+    assert "免费额度" in msg
+    assert "控制台" in msg or "充值" in msg, "要告诉用户去哪儿解决"
+
+
+# ============================================================
+#  连接静默死亡（这一组全部由「额度耗尽」场景暴露出来）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_session_fatal_from_event_handler_is_not_swallowed():
+    """
+    on_event 抛出的 SessionFatal 必须透传。
+
+    识别出致命错误后，_on_qwen_event 会 raise SessionFatal
+    来终止会话。这个异常要穿过 _handle 的通用 except 回到
+    接收循环。被吞掉的话接收循环不终止，连接死了会话还挂着，
+    用户看到「报错了但画面卡住不动」。
+    """
+    from app.core.realtime import RealtimeSession, SessionFatal
+
+    async def on_event(ev):
+        raise SessionFatal("AllocationQuota.FreeTierOnly")
+
+    rt = RealtimeSession.__new__(RealtimeSession)
+    rt.on_event = on_event
+    rt._last_error = None
+
+    with pytest.raises(SessionFatal):
+        await RealtimeSession._handle(rt, {"type": "error",
+                                           "error": {"code": "x"}})
+    with pytest.raises(SessionFatal):
+        await RealtimeSession._handle(rt, {"code": "AllocationQuota.FreeTierOnly"})
+
+
+def test_recv_task_has_done_callback():
+    """
+    接收任务必须挂 done 回调。
+
+    它是 fire-and-forget 创建的，没人 await。不挂回调的话，
+    SessionFatal 只会静静存在 task 对象里，永远没人发现 ——
+    这正是「服务端已死、程序又空转 24 分钟」的根因。
+    """
+    import pathlib
+
+    src = pathlib.Path(
+        "./app/core/realtime.py"
+    ).read_text()
+    i = src.index("self._recv_task = asyncio.create_task(self._recv_loop())")
+    tail = src[i:i + 400]
+    assert "add_done_callback" in tail, "接收任务必须挂 done 回调"
+    assert "def _on_recv_done" in src
+
+
+def test_fatal_error_reaches_client_as_aborted():
+    """
+    致命错误必须发 aborted 给前端。
+
+    前端一直在处理 aborted，但服务端从来没发过 —— 致命错误
+    只以普通 error 出现，用户看到「莫名其妙结束了」，
+    也不知道该去充值还是重试。
+    """
+    import pathlib
+
+    src = pathlib.Path(
+        "./app/api/server.py"
+    ).read_text()
+    assert '"type": "aborted"' in src, "服务端必须发 aborted（前端在等它）"
+    assert "_fatal_message(fatal)" in src, "aborted 要带人能看懂的原因"
+
+
+def test_connection_loss_is_detected():
+    """
+    会话必须能发现「语音连接已经死了」。
+
+    没有这个判断，timer 循环会一直发 tick ——
+    用户对着一个死连接说话而界面毫无异常。
+    """
+    import pathlib
+
+    src = pathlib.Path(
+        "./app/services/session.py"
+    ).read_text()
+    assert "def is_connection_lost" in src
+
+    srv = pathlib.Path(
+        "./app/api/server.py"
+    ).read_text()
+    assert "is_connection_lost()" in srv, "timer 循环要看护连接存活"
+
+
+def test_connection_lost_false_when_deliberately_closing():
+    """
+    主动关闭不能被误判成「掉线」。
+
+    close() 也会结束接收任务并把 ready 清掉，
+    判据必须区分「我们主动关的」和「对端断了」，
+    否则每次正常收尾都会被当成异常掉线。
+    """
+    from app.services.session import ConversationSession, SessionStats
+
+    class FakeTask:
+        def done(self):
+            return True
+
+        def cancelled(self):
+            return False
+
+    class RT:
+        _recv_task = FakeTask()
+        closed = True          # 主动关闭
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.ended = False
+    s.rt = RT()
+    assert ConversationSession.is_connection_lost(s) is False
+
+    RT.closed = False          # 对端断开
+    assert ConversationSession.is_connection_lost(s) is True
+
+    s.ended = True
+    assert ConversationSession.is_connection_lost(s) is False

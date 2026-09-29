@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..core.config import Settings, load_settings
 from ..core.content import load_content
+from ..core.realtime import SessionFatal
 from ..core.voiceprint import SpeakerVerifier, load_voiceprint
 from ..services.corrector import Corrector
 from ..services.planner import Planner, build_tutor_instructions
@@ -358,12 +359,20 @@ async def ws_session(ws: WebSocket):
 
         # asyncio.wait 只是"返回"完成的任务，不会抛出其中的异常。
         # 必须逐个取 exception()，否则真实错误会被静默吞掉。
+        fatal = None
         for t in done:
             exc = t.exception()
             if exc is None:
                 continue
             if isinstance(exc, (WebSocketDisconnect, _StopRequested)):
                 log.info("会话正常结束: %s", type(exc).__name__)
+            elif isinstance(exc, SessionFatal):
+                # 连接不可用了（额度耗尽/被服务端关闭等）。
+                # 必须明确告诉用户「为什么结束」，并让他看报告 ——
+                # 只当普通异常记一笔的话，用户看到的是
+                # 「莫名其妙就结束了」，也不知道该怎么办。
+                fatal = str(exc)
+                log.warning("会话因致命错误结束: %s", fatal)
             else:
                 log.warning("会话任务异常: %r", exc)
 
@@ -372,6 +381,14 @@ async def ws_session(ws: WebSocket):
         await asyncio.gather(*pending, return_exceptions=True)
 
         await sess.stop()
+
+        # 致命错误先告诉用户发生了什么、能怎么办
+        if fatal:
+            await ws.send_json({
+                "type": "aborted",
+                "reason": fatal,
+                "message": _fatal_message(fatal),
+            })
 
         # 结束报告（直接读库，不经过 HTTP 路由层）
         await ws.send_json({"type": "finished", "session_id": sid,
@@ -414,7 +431,12 @@ def _fatal_message(code: str) -> str:
         return ("很久没有听到你说话了，服务端已关闭本次会话。"
                 "录音还在，可以接着看报告；想继续就重新开始一次。")
     if "quota" in c or "insufficient" in c:
-        return "账户额度不足，本次会话已中断。"
+        # 说清楚怎么办，而不是只说"额度不足"。
+        # 免费额度用完后阿里云会在错误里提示两种出路，
+        # 不告诉用户的话他只能一脸茫然地反复重试。
+        return ("语音模型的免费额度用完了，本次会话无法继续。"
+                "到阿里云百炼控制台充值，或关掉「仅使用免费额度」"
+                "即可恢复。本次已录到的内容都还在，可以看报告。")
     if "api_key" in c or "auth" in c:
         return "密钥无效或已过期，请检查 .env 配置。"
     if "rate" in c:
@@ -466,6 +488,13 @@ async def _timer_loop(ws: WebSocket, sess: ConversationSession) -> None:
                               "message": "对话记忆整理失败，"
                                          "建议结束本轮重新开始"},
                 })
+
+        # 连接死了就得结束会话，不能继续发 tick 假装一切正常。
+        # 实测：服务端报错并断开后，程序又空转了 24 分钟，
+        # 用户对着一个死连接说话而界面毫无异常。
+        if sess.is_connection_lost():
+            log.warning("检测到语音连接已断开，结束会话")
+            raise SessionFatal(sess.fatal_error or "connection_closed")
 
         snap = sess.snapshot()
         await sess.on_client({

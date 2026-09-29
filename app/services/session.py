@@ -444,6 +444,28 @@ class ConversationSession:
 
     # ---------- 计时 ----------
 
+    def is_connection_lost(self) -> bool:
+        """
+        语音连接是不是已经死了。
+
+        判据：接收任务已结束、且我们没在主动关闭。
+        不看 rt.ready —— 那个标志在 close() 里也会被清掉，
+        用它判断会把「正常收尾」误判成「异常掉线」。
+
+        为什么需要这个：接收任务抛出的 SessionFatal 没人 await，
+        异常只存在 task 对象里。没有这层看护，连接死了上层
+        完全不知道，会话一直挂着发 tick。
+        """
+        if self.ended or not self.rt:
+            return False
+        task = getattr(self.rt, "_recv_task", None)
+        if task is None:
+            return False
+        if not task.done() or task.cancelled():
+            return False
+        # 主动关闭时 closed 已置位，属于正常收尾
+        return not getattr(self.rt, "closed", False)
+
     def wants_rotate(self) -> bool:
         """是否有待处理的轮转请求（由外部循环消费）。"""
         return self._want_rotate

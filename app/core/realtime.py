@@ -52,6 +52,15 @@ def is_recoverable_error(code: str) -> bool:
     return "too many audio" in c or "too_many_audio" in c
 
 
+# 额度类错误：重连也不会好，必须如实告诉用户去充值/改计费方式，
+# 而不是让他对着一个永远连不上的会话反复重试。
+QUOTA_CODES = {
+    "AllocationQuota.FreeTierOnly",
+    "AllocationQuota.FreeTierExceeded",
+    "Throttling.AllocationQuota",
+    "insufficient_quota",
+}
+
 FATAL_CODES = {
     "user_idle_timeout",     # 用户长时间没说话，服务端关闭
     "session_expired",
@@ -67,7 +76,19 @@ FATAL_CODES = {
 
 def is_fatal_error(code) -> bool:
     c = str(code or "").lower()
-    return any(f in c for f in FATAL_CODES)
+    return any(f in c for f in FATAL_CODES) or is_quota_error(code)
+
+
+def is_quota_error(code) -> bool:
+    """
+    是否是额度/计费问题。
+
+    单独拎出来是因为要给不同的提示：致命错误说「连接不可用了」，
+    额度问题要说「去充值或关掉仅用免费额度」——
+    后者用户自己能解决，前者只能重试。
+    """
+    c = str(code or "").lower()
+    return any(q.lower() in c for q in QUOTA_CODES)
 
 # 事件处理器：收到事件时调用，可 await
 EventHandler = Callable[[dict], Awaitable[None]]
@@ -102,6 +123,9 @@ class RealtimeSession:
         self.closed = False
         self.session_id: Optional[str] = None
         self._recv_task: Optional[asyncio.Task] = None
+        # 由接收任务结束时写入，供上层判断「连接是不是因为
+        # 致命错误而死的」（区别于正常关闭）
+        self.fatal_code: Optional[str] = None
         self._last_error: Optional[str] = None
         self.last_usage: Optional[dict] = None
 
@@ -134,6 +158,13 @@ class RealtimeSession:
 
         await self._configure()
         self._recv_task = asyncio.create_task(self._recv_loop())
+        # 接收任务是 fire-and-forget 的，没人 await 它。
+        # 不给它挂回调的话，_recv_loop 里冒出来的异常（尤其是
+        # SessionFatal）会被静静存在 task 对象里，永远没人发现 ——
+        # 上层以为连接还好着，会话一直挂着发 tick，
+        # 用户看到「报错了但画面卡住不动」。
+        # 实测这个坑让一次会话在服务端已死之后又空转了 24 分钟。
+        self._recv_task.add_done_callback(self._on_recv_done)
 
     async def _configure(self) -> None:
         """发送 session.update，配置语音、提示词、VAD。"""
@@ -207,6 +238,29 @@ class RealtimeSession:
         finally:
             self.ready = False
 
+    def _on_recv_done(self, task: "asyncio.Task") -> None:
+        """
+        接收任务结束时把异常暴露出来。
+
+        CancelledError 是我们自己 close() 时取消的，正常，不记。
+        其它异常都要记下来并通过 _last_error 让上层能看到 ——
+        否则连接死了而没人知道。
+        """
+        self.ready = False
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            if not self.closed:
+                log.warning("接收循环已结束（连接被对端关闭）")
+            return
+        if isinstance(exc, SessionFatal):
+            log.warning("接收循环因致命错误终止: %s", exc)
+            self.fatal_code = str(exc)
+        else:
+            log.warning("接收循环异常终止: %r", exc)
+        self._last_error = f"{type(exc).__name__}: {exc}"
+
     async def _handle(self, ev: dict) -> None:
         t = ev.get("type", "")
 
@@ -214,6 +268,37 @@ class RealtimeSession:
             err = ev.get("error") or {}
             self._last_error = f"{err.get('code')}: {err.get('message')}"
             log.warning("Qwen 返回错误: %s", self._last_error)
+
+        # 判据收紧到「必须有 code」：真实的服务端错误帧一定带 code，
+        # 而正常帧偶尔也会带无关的 message 字段 ——
+        # 只凭 message 判断会把正常帧误报成错误。
+        elif not t and ev.get("code"):
+            # 服务端有些错误不带 type，只有 code/message 两个字段。
+            # 典型：额度耗尽时回
+            #   {"code": "AllocationQuota.FreeTierOnly", "message": "..."}
+            # 然后直接掐断连接。
+            #
+            # 不识别这种情况的后果：接收循环只看到「连接意外关闭」，
+            # 会话被当成正常结束，用户看到的是「莫名其妙就结束了」，
+            # 而真正的原因（额度用完）完全没显示出来。
+            code = str(ev.get("code") or "")
+            msg = str(ev.get("message") or "")
+            self._last_error = f"{code}: {msg}" if code else msg
+            log.warning("Qwen 返回无 type 错误帧: %s", self._last_error)
+            if self.on_event:
+                try:
+                    await self.on_event({
+                        "type": "error",
+                        "error": {"code": code, "message": msg},
+                    })
+                except SessionFatal:
+                    # 致命信号必须透传，不能降级成 warning ——
+                    # 吞掉的话接收循环不会终止，会话一直挂着，
+                    # 用户看到的是「报错了但画面卡住不动」。
+                    raise
+                except Exception as e:
+                    log.warning("错误事件处理失败: %s", e)
+            return
 
         elif t == "response.done":
             resp = ev.get("response") or {}
@@ -223,6 +308,13 @@ class RealtimeSession:
         if self.on_event:
             try:
                 await self.on_event(ev)
+            except SessionFatal:
+                # 致命信号必须透传。
+                # 上面那三个分支都可能让 on_event 抛 SessionFatal
+                # （比如识别出额度耗尽），被这里吞掉的话
+                # 接收循环不会终止，会话就一直挂着不结束 ——
+                # 用户那边表现为「报错了但画面卡住不动」。
+                raise
             except Exception as e:
                 log.warning("事件处理失败 (%s): %s", t, e)
 
