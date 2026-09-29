@@ -1,0 +1,40 @@
+# ---- 密钥与配置 ----
+.env
+.env.local
+*.key
+*.pem
+
+# ---- 云 CLI 凭据（含 OAuth token 缓存，绝不能入库）----
+.azure-config/
+.aws/
+.config/gcloud/
+.msal_http_cache.bin
+msal_token_cache.json
+
+# ---- 数据（个人隐私，绝不入库）----
+data/
+!data/.gitkeep
+voiceprint.json
+*.wav
+
+# ---- 原型（冻结，不纳入新工程版本管理）----
+prototype/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- 模型（体积大）----
+models/
+*.onnx
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/

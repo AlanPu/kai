@@ -1,0 +1,28 @@
+# 英语口语陪练 — 运行依赖
+#
+# 安装：.venv/bin/pip install -r requirements.txt
+# 注意：语音链路（Qwen Realtime）为国内服务，安装走代理即可。
+
+# ---- Web 服务 ----
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+
+# ---- 实时通信 ----
+websockets==17.1
+
+# ---- 音频处理 ----
+numpy==2.5.3
+
+# ---- 声纹识别（不依赖 PyTorch）----
+sherpa-onnx==1.13.8
+
+# ---- 配置 ----
+python-dotenv==1.2.3
+
+# ---- HTTPS 证书（手机访问需要）----
+cryptography==50.0.1
+
+# ---- 开发依赖 ----
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1
