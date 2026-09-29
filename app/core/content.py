@@ -94,12 +94,46 @@ def classify(raw: str) -> str:
 #  网址抓取
 # ============================================================
 
+# 明确列出的禁止网段。
+# 不能用 ipaddress 的 is_private —— 它会把 2001::1 这类
+# 正常公网 IPv6 判成 private（实测踩到），导致整站被拦。
+_BLOCKED_V4 = [
+    ipaddress.ip_network("0.0.0.0/8"),        # 本机
+    ipaddress.ip_network("10.0.0.0/8"),       # 内网
+    ipaddress.ip_network("100.64.0.0/10"),    # 运营商级 NAT
+    ipaddress.ip_network("127.0.0.0/8"),      # 环回
+    ipaddress.ip_network("169.254.0.0/16"),   # 链路本地
+    ipaddress.ip_network("172.16.0.0/12"),    # 内网
+    ipaddress.ip_network("192.0.0.0/24"),     # IETF 保留
+    ipaddress.ip_network("192.168.0.0/16"),   # 内网
+    ipaddress.ip_network("198.18.0.0/15"),    # 基准测试
+    ipaddress.ip_network("224.0.0.0/4"),      # 组播
+    ipaddress.ip_network("240.0.0.0/4"),      # 保留
+]
+_BLOCKED_V6 = [
+    ipaddress.ip_network("::/128"),           # 未指定
+    ipaddress.ip_network("::1/128"),          # 环回
+    ipaddress.ip_network("fc00::/7"),         # 唯一本地
+    ipaddress.ip_network("fe80::/10"),        # 链路本地
+    ipaddress.ip_network("ff00::/8"),         # 组播
+]
+
+
+def _is_blocked(ip: ipaddress._BaseAddress) -> bool:
+    nets = _BLOCKED_V4 if ip.version == 4 else _BLOCKED_V6
+    return any(ip in n for n in nets)
+
+
 def _assert_public_host(url: str) -> None:
     """
     拒绝内网地址（SSRF 防护）。
 
     用户可能粘贴 localhost 或 192.168.x.x，
     服务器替他去请求这些地址是不合适的。
+
+    注意：只有**全部**解析结果都是内网才算危险。
+    很多正常网站会同时解析出公网 IPv4 和一个内网标记的 IPv6，
+    只要有公网地址就应该放行（实测 en.wikipedia.org 属于此类）。
     """
     host = urlparse(url).hostname
     if not host:
@@ -108,11 +142,13 @@ def _assert_public_host(url: str) -> None:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
         raise ValueError(f"域名无法解析: {host}") from e
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved):
-            raise ValueError(f"拒绝访问内网地址: {host}")
+
+    addrs = {info[4][0] for info in infos}
+    if not addrs:
+        raise ValueError(f"域名无解析结果: {host}")
+
+    if all(_is_blocked(ipaddress.ip_address(a)) for a in addrs):
+        raise ValueError(f"拒绝访问内网地址: {host}")
 
 
 def fetch_url(url: str, timeout: int = FETCH_TIMEOUT) -> Content:

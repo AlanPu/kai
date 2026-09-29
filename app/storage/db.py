@@ -11,7 +11,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from .models import (Correction, InputKind, ProfileFact, Session,
                      SessionStatus, Turn)

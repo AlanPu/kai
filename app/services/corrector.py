@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from ..core.llm import LLMClient, LLMError
+from ..core.llm import LLMClient
 
 log = logging.getLogger(__name__)
 
