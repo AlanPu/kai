@@ -200,6 +200,35 @@ async def run(minutes: float, url: str, *, talk_every: float = 25.0):
     return len(w.errors) == 0 and w.user_texts > 0
 
 
+def check_alive(host: str) -> None:
+    """
+    确认目标服务器在跑。
+
+    为什么要这一步：曾经端口上留着一个旧进程在监听，
+    新进程 bind 失败（错误写在另一个日志文件里），
+    于是整个 30 分钟测试跑的是旧代码。
+    结论看起来完美，实际全部作废 —— 直到对比 PID 才发现。
+
+    宁可启动时就失败，也不要白跑 30 分钟。
+    """
+    import urllib.request
+
+    url = f"http://{host}/api/health"
+    try:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with op.open(url, timeout=8) as r:
+            data = json.loads(r.read().decode())
+    except Exception as e:
+        port = host.split(":")[-1]
+        raise SystemExit(
+            f"❌ 连不上 {url}（{type(e).__name__}: {e}）\n"
+            "   请先启动服务器，并确认端口上不是残留的旧进程：\n"
+            f"     lsof -nP -iTCP:{port} -sTCP:LISTEN")
+
+    print(f"  服务器就绪：语音={data.get('voice_ready')} "
+          f"文本={data.get('text_ready')} 模型={data.get('model')}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=30)
@@ -207,6 +236,11 @@ def main():
     ap.add_argument("--content", default="稳定性测试 聊一聊我的工作")
     ap.add_argument("--talk-every", type=float, default=25.0)
     a = ap.parse_args()
+
+    # 先确认服务器活着。踩过的坑：端口上有个旧的残留进程在监听，
+    # 新进程 bind 失败但日志在另一个文件里，于是测试跑的是旧代码，
+    # 结论全部作废 —— 直到我对比 PID 才发现。
+    check_alive(a.host)
 
     url = (f"ws://{a.host}/ws/session?content={quote(a.content)}"
            f"&voiceprint=0")
