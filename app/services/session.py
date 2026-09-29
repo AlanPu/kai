@@ -41,10 +41,13 @@ AUDIO_ITEM_LIMIT = 320
 # 提前轮转的阈值。
 #
 # 我数的是 input_audio_buffer.committed，而服务端计的是全部
-# audio item（还含 AI 的输出 item），所以我数到的数字偏小 ——
-# 实测每轮对话我数到约 2 条，而服务端计约 2.6 条。
-# 因此阈值要保守：数到 240 就轮转，别等真到 320 才反应。
-AUDIO_ITEM_ROTATE_AT = 240
+# audio item（还含 AI 的输出 item），两者不是一回事，
+# 实测我数到的明显偏少（30 分钟实测：服务端已 320，我还没到 240）。
+#
+# 所以阈值取「远低于观测比例」的安全值。
+# 提前轮转的代价只是 1~2 秒停顿，撞上限的代价是报错，
+# 两者不对等 —— 宁可早转。
+AUDIO_ITEM_ROTATE_AT = 150
 
 # 静音门槛（int16 量级）：低于此值不送声纹判定，但仍积累在待定缓冲
 VOICE_RMS_FLOOR = 120
@@ -273,7 +276,8 @@ class ConversationSession:
                 # 只置标志，真正的重连由外部循环执行。
                 # 不能在这里直接关连接 —— 会掐断正在跑本回调的
                 # _recv_loop，异常冒泡出去整个会话就被判异常结束。
-                log.warning("audio item 超限，请求轮转")
+                log.warning("audio item 超限（我数到 %d 条），请求轮转",
+                            self.stats.audio_items)
                 self._want_rotate = True
                 return
 

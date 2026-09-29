@@ -31,6 +31,14 @@ from ..services.session import ConversationSession
 from ..storage.db import Database
 
 log = logging.getLogger(__name__)
+
+# 把应用日志接到 uvicorn 的 handler 上。
+# 不配的话 log.info 永远不显示 —— 排查轮转、画像这些
+# 后台行为时会误以为「没执行」，实际只是没打印。
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(name)s: %(message)s",
+)
 # server.py 在 app/api/ 下，静态页面在 app/web/
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
