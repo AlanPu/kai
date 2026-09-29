@@ -63,6 +63,10 @@ class Watch:
         self.audio_out = 0
         self.user_texts = 0
         self.ai_texts = 0
+        # 纠错一直是盲区：脚本从不统计它，导致「纠错没送达」
+        # 这种问题只能靠人工盯日志才能发现。
+        self.corrections = 0
+        self.correction_kinds: dict[str, int] = {}
         self.errors: list[str] = []
         self.mem_samples: list[tuple[float, float]] = []
 
@@ -125,6 +129,18 @@ async def run(minutes: float, url: str, *, talk_every: float = 25.0):
                         w.ai_texts += 1
                         print(f"  [{w.elapsed():6.0f}s] AI: "
                               f"{m['text'][:60]}")
+                    elif t == "correction":
+                        w.corrections += 1
+                        k = m.get("kind", "?")
+                        w.correction_kinds[k] = w.correction_kinds.get(k, 0) + 1
+                        if w.corrections <= 5:
+                            print(f"  [{w.elapsed():6.0f}s] 📝 "
+                                  f"{m.get('original','')[:32]} → "
+                                  f"{m.get('suggestion','')[:32]}")
+                    elif t == "aborted":
+                        msg = f"aborted: {m.get('reason')}"
+                        w.errors.append(msg)
+                        print(f"  [{w.elapsed():6.0f}s] ⛔ {m.get('message')}")
                     elif t == "error":
                         e = m.get("error") or {}
                         msg = f"{e.get('code')}: {e.get('message')}"
@@ -161,6 +177,7 @@ async def run(minutes: float, url: str, *, talk_every: float = 25.0):
     print(f"  音频 入 {w.audio_in} 块（{w.audio_in*20/1000/60:.1f} 分钟）/ "
           f"出 {w.audio_out} 块")
     print(f"  转写 我 {w.user_texts} 句 / AI {w.ai_texts} 句")
+    print(f"  纠错 {w.corrections} 条  {w.correction_kinds or ''}")
     print(f"  内存 {w.mem_samples[0][1]:.0f} → {mem_mb():.0f} MB")
     if len(w.mem_samples) > 2:
         growth = mem_mb() - w.mem_samples[1][1]
@@ -175,6 +192,11 @@ async def run(minutes: float, url: str, *, talk_every: float = 25.0):
 
     if w.user_texts == 0:
         print("  ⚠️ 从未识别出用户语音 —— VAD 或音频未被接受")
+    # 纠错链路是需求的核心，用户说了话却一条纠错都没有很可疑。
+    # 不直接判失败：测试音频本身语法正确时，没纠错才是对的。
+    if w.user_texts >= 3 and w.corrections == 0:
+        print("  ⚠️ 有话了但没有纠错 —— 若音频本身无错则正常，"
+              "否则要查纠错链路")
     return len(w.errors) == 0 and w.user_texts > 0
 
 
