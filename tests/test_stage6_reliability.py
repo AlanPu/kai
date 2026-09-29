@@ -521,9 +521,13 @@ def test_audio_limit_constants_are_conservative():
     from app.services.session import (AUDIO_ITEM_LIMIT,
                                       AUDIO_ITEM_ROTATE_AT)
     assert AUDIO_ITEM_LIMIT == 320, "Qwen 的硬上限"
-    assert AUDIO_ITEM_ROTATE_AT < AUDIO_ITEM_LIMIT
-    # 留足余量：至少 15%（约 15 轮对话）
-    assert AUDIO_ITEM_ROTATE_AT <= AUDIO_ITEM_LIMIT * 0.85
+
+    # 实测标定：服务端报 320 时，我这里只数到 91（比例约 3.5:1）。
+    # 阈值必须明显低于 91，否则等服务端到顶时我还差得远 ——
+    # 这正是阈值 150 那次失败的原因（报错时我才数到 91）。
+    assert AUDIO_ITEM_ROTATE_AT < 91, \
+        "阈值必须低于实测的危险点 91，否则轮转永远来不及"
+    assert AUDIO_ITEM_ROTATE_AT >= 30, "太低会导致过于频繁地重连"
 
 
 def test_recoverable_error_detection():
@@ -637,3 +641,45 @@ def test_wants_rotate_is_consumed_once():
     i = src.index("async def rotate_context")
     body = src[i:i + 900]
     assert "_want_rotate = False" in body, "进入轮转时应先清标志"
+
+
+@pytest.mark.asyncio
+async def test_stop_survives_close_failure():
+    """
+    关连接失败不能挡住收尾。
+
+    如果 stop() 里 await rt.close() 抛出去，
+    后面的报告就发不出去，前端会永远停在
+    「正在生成报告…」转圈 —— 用户以为程序卡死了。
+    """
+    from app.services.session import ConversationSession, SessionStats
+
+    class BoomRT:
+        last_usage = None
+
+        async def close(self):
+            raise RuntimeError("模拟关闭失败")
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.ended = False
+    s.rt = BoomRT()
+    s.stats = SessionStats()
+    s.session_id = 1
+    s._correction_tasks = set()
+    s._user_since_extract = []
+    s._paused_at = None
+    s.paused = False
+    s.paused_total = 0.0
+    s.duration_limit = 1800
+    import time
+    s.started_at = time.time()
+
+    closed = []
+    s.db = type("DB", (), {
+        "refresh_session_stats": lambda *a: None,
+        "finish_session": lambda *a, **k: closed.append(1),
+    })()
+
+    await ConversationSession.stop(s)      # 不该抛出
+    assert s.ended is True
+    assert closed, "即使关连接失败，也应当完成收尾落库"

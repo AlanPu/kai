@@ -40,14 +40,17 @@ SendToClient = Callable[[dict], Awaitable[None]]
 AUDIO_ITEM_LIMIT = 320
 # 提前轮转的阈值。
 #
-# 我数的是 input_audio_buffer.committed，而服务端计的是全部
-# audio item（还含 AI 的输出 item），两者不是一回事，
-# 实测我数到的明显偏少（30 分钟实测：服务端已 320，我还没到 240）。
+# 我数的是 input_audio_buffer.committed，服务端计的是全部
+# audio item（还含 AI 的输出 item、以及 VAD 切碎的内部片段）。
 #
-# 所以阈值取「远低于观测比例」的安全值。
-# 提前轮转的代价只是 1~2 秒停顿，撞上限的代价是报错，
+# 30 分钟实测标定：服务端报「已到 320」时，我这边只数到 91 条 ——
+# 比例约 3.5:1。按这个比例，阈值必须远低于 91，
+# 否则等服务端到顶时我还差得远（这正是 150 那次失败的原因）。
+#
+# 取 60：约在服务端 210 条时轮转，留 110 条余量。
+# 提前轮转的代价只是 1~2 秒停顿，撞上限的代价是断线，
 # 两者不对等 —— 宁可早转。
-AUDIO_ITEM_ROTATE_AT = 150
+AUDIO_ITEM_ROTATE_AT = 60
 
 # 静音门槛（int16 量级）：低于此值不送声纹判定，但仍积累在待定缓冲
 VOICE_RMS_FLOOR = 120
@@ -161,8 +164,14 @@ class ConversationSession:
         for t in list(self._correction_tasks):
             t.cancel()
 
+        # 关连接本身可能失败或卡住（Qwen 不一定会回 close 帧）。
+        # 这里必须兜住：一旦抛出去，后面的报告就发不出去，
+        # 前端会永远停在「正在生成报告…」转圈。
         if self.rt:
-            await self.rt.close()
+            try:
+                await self.rt.close()
+            except Exception as e:
+                log.warning("关闭语音连接失败: %s", e)
 
         # 结束前把剩下的发言也抽一次画像
         try:
@@ -173,9 +182,14 @@ class ConversationSession:
         # 用 elapsed()：暂停的时间不算练习时长
         elapsed = int(self.elapsed())
         usage = self.rt.last_usage if self.rt else None
-        self.db.refresh_session_stats(self.session_id)
-        self.db.finish_session(self.session_id, status=status,
-                               duration_sec=elapsed, usage=usage)
+        # 同样兜住：落库失败不该挡住用户看报告（前面已经存了逐条发言，
+        # 丢的只是汇总统计）。
+        try:
+            self.db.refresh_session_stats(self.session_id)
+            self.db.finish_session(self.session_id, status=status,
+                                   duration_sec=elapsed, usage=usage)
+        except Exception as e:
+            log.error("会话收尾落库失败: %s", e)
 
     # ---------- 音频输入 ----------
 
