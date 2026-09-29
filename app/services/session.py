@@ -47,6 +47,9 @@ class SessionStats:
     blocked_sec: float = 0.0
     user_chars: int = 0
     ai_chars: int = 0
+    # 用户开始说话的次数。用来识别"每句都只说一次就没了"这类问题 ——
+    # 如果它只涨到 1，说明用户说完第一句后再也发不出声音。
+    user_speech_starts: int = 0
 
 
 class ConversationSession:
@@ -257,8 +260,17 @@ class ConversationSession:
             return
 
         if is_speech_started(ev):
-            # 用户抢话：AI 应停止说话
-            self._model_speaking = True
+            # 用户开始说话 = 抢话。
+            #
+            # 这里曾经写成 _model_speaking = True，是个严重后果的逻辑错误：
+            # push_audio 在 _model_speaking 为真时丢弃所有音频，
+            # 而该标志只在 response.done 复位。
+            # 于是用户说第一句后就再也不能说话 —— 音频全被丢掉，
+            # 不产生 response，也就永远等不到 response.done，形成死锁。
+            #
+            # 正确语义：speech_started 意味着「轮到用户」，AI 要闭嘴。
+            self._model_speaking = False
+            self.stats.user_speech_starts += 1
             await self.on_client({"type": "user_speaking"})
             return
 
@@ -412,6 +424,7 @@ class ConversationSession:
             "audio_in_blocks": self.stats.audio_in_blocks,
             "audio_out_blocks": self.stats.audio_out_blocks,
             "blocked_chunks": self.stats.blocked_chunks,
+            "user_speech_starts": self.stats.user_speech_starts,
             "blocked_sec": round(self.stats.blocked_sec, 1),
             "user_chars": self.stats.user_chars,
             "ai_chars": self.stats.ai_chars,

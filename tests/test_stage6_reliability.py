@@ -396,3 +396,109 @@ def test_snapshot_reports_paused_state():
     snap = s.snapshot()
     assert snap["paused"] is True
     assert "paused_sec" in snap
+
+
+# ============================================================
+#  严重回归：用户只能说话一次
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_user_speech_start_does_not_lock_out_user():
+    """
+    回归：本项目最严重的一个逻辑错误。
+
+    is_speech_started 表示「用户开始说话」，
+    但代码当时把它当成「AI 开始说话」，置 _model_speaking = True。
+
+    而 push_audio 在 _model_speaking 为真时丢弃所有音频，
+    该标志又只在 response.done 复位 ——
+    于是用户说完第一句后再也发不出声音，音频全被丢掉，
+    不产生 response，也就永远等不到 response.done，形成死锁。
+
+    实测后果：一整场练习里用户只能被识别一次。
+    """
+    from app.services.session import ConversationSession, SessionStats
+
+    async def on_client(m):
+        pass
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.on_client = on_client
+    s.ended = False
+    s.verifier = None
+    s.stats = SessionStats()
+    s._model_speaking = False
+
+    await ConversationSession._on_qwen_event(
+        s, {"type": "input_audio_buffer.speech_started"})
+
+    assert s._model_speaking is False, \
+        "用户开始说话时必须解除 AI 说话状态，否则用户会被永久静音"
+    assert s.stats.user_speech_starts == 1
+
+
+@pytest.mark.asyncio
+async def test_audio_flows_after_user_speech_started():
+    """用户开始说话后，音频必须能继续送上去。"""
+    from app.services.session import (ConversationSession, SessionStats,
+                                      VOICE_RMS_FLOOR)
+
+    async def on_client(m):
+        pass
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.on_client = on_client
+    s.ended = False
+    s.paused = False
+    s.stats = SessionStats()
+    s._model_speaking = False
+    s.verifier = None
+
+    sent = []
+
+    class FakeRT:
+        last_usage = None
+
+        async def send_audio(self, b):
+            sent.append(b)
+
+    s.rt = FakeRT()
+
+    # 模拟用户开始说话
+    await ConversationSession._on_qwen_event(
+        s, {"type": "input_audio_buffer.speech_started"})
+
+    # 再发一块有声音的音频，必须被送出
+    loud = (b"\x10\x20" * 320)          # 非静音
+    await ConversationSession.push_audio(s, loud)
+    assert sent, "用户说话后音频不该被丢弃"
+    assert s.stats.audio_in_blocks == 1
+
+
+@pytest.mark.asyncio
+async def test_response_done_clears_speaking_flag():
+    """AI 说完后要复位标志，轮到用户。"""
+    from app.services.session import ConversationSession, SessionStats
+
+    async def on_client(m):
+        pass
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.on_client = on_client
+    s.ended = False
+    s.verifier = None
+    s.stats = SessionStats()
+    s._model_speaking = True
+
+    await ConversationSession._on_qwen_event(
+        s, {"type": "response.done"})
+    assert s._model_speaking is False
+
+
+def test_stats_has_speech_start_counter():
+    """
+    这个计数器是排查上面那个 bug 的关键手段：
+    它只涨到 1 就说明用户说完第一句后再也发不出声音。
+    """
+    from app.services.session import SessionStats
+    assert SessionStats().user_speech_starts == 0
