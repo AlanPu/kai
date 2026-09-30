@@ -1,48 +1,57 @@
 # 口语陪练 —— 搭建指南
 
-## 两种用法
+## 怎么启动
 
-| 方式 | 命令 | 适合 |
-|---|---|---|
-| **命令行**（阶段 1） | `.venv/bin/python realtime_qwen.py --headphone` | 电脑上快速练 |
-| **网页版**（阶段 2） | `.venv/bin/python server.py --ssl` | 手机/平板/任何浏览器 |
+**只有一个入口**：
 
-**网页版更快进入状态 →** 见 [网页版](#网页版阶段-2)。
+```bash
+cd kai
+.venv/bin/python -m app                # 本机用，浏览器打开 http://127.0.0.1:8000
+.venv/bin/python -m app --ssl          # 手机用，需要 HTTPS
+.venv/bin/python -m app --port 8001    # 换端口
+```
 
-## ✅ 当前方案：Qwen Realtime（对话）+ Azure Speech（评测）
+想省事就用 `.venv/bin/python run.py`（等价，会打印访问地址）。
+
+> ⚠️ **不要运行 `python server.py`** —— 那个文件已经删掉了。
+> 它是原型期的入口，正式版拆成了 `app/` 包。
+> 如果你看到 `can't open file '.../server.py'`，就是这个原因，
+> 换成上面的 `-m app` 即可。原型仍完整保留在 `prototype/` 里。
+
+## ✅ 当前方案：Qwen Realtime（对话）+ 声纹过滤 + 文本纠错
 
 ```
 对话层  →  阿里云百炼 qwen3.8-omni-flash-realtime   （个人可开通，国内直连）
-评测层  →  Azure Speech Pronunciation Assessment     （个人可用，不受 OpenAI 准入限制）
+纠错层  →  qwen-plus（OpenAI 兼容接口）
+声纹层  →  3D-Speaker CAM++（纯本地 ONNX，不出本机）
 ```
 
-### 文件
+### 目录结构
 
-| 文件 | 用途 |
+| 路径 | 用途 |
 |---|---|
-| `core.py` | **共享核心**：协议、算法、声纹（CLI 和网页版共用） |
-| `realtime_qwen.py` | 命令行版对话程序 |
-| `server.py` | **网页版**服务端（FastAPI） |
-| `web/index.html` | **网页版**前端（单文件） |
-| `enroll_voice.py` | 声纹录入 |
-| `make_cert.py` | 生成 HTTPS 自签证书（手机用） |
-| `check_qwen.py` | 自检（不推送音频，几乎零成本） |
-| `.env.example` | 配置模板 |
+| `app/api/server.py` | HTTP + WebSocket 服务端（FastAPI） |
+| `app/core/` | 协议、实时连接、声纹、录入（不依赖上层） |
+| `app/services/` | 备课、纠错、会话编排、用户与画像 |
+| `app/storage/` | SQLite、表结构、迁移 |
+| `app/web/index.html` | 前端（单文件） |
+| `models/campplus.onnx` | 声纹模型，**需自行下载**（见下文） |
+| `scripts/` | 运维脚本（证书生成、连通性自检、公开性检查、压测） |
+| `prototype/` | 原型期的旧代码，**已冻结**，仅供对照 |
 
 ### 三步跑起来
 
 ```bash
-cd kai          # 进到本项目目录
-cp .env.example .env
-# 编辑 .env，填 DASHSCOPE_API_KEY 和 QWEN_WORKSPACE_ID
-
-.venv/bin/python check_qwen.py                      # 先自检
-.venv/bin/python realtime_qwen.py --topic "travel plans"
+cd kai                              # 进到本项目目录
+cp .env.example .env                # 编辑 .env，填 DASHSCOPE_API_KEY 和 QWEN_WORKSPACE_ID
+mkdir -p models && curl -L -o models/campplus.onnx \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+.venv/bin/python scripts/check_qwen.py   # 自检：确认密钥/区域/模型都能用（几乎零成本）
+.venv/bin/python -m app             # 启动，浏览器打开 http://127.0.0.1:8000
 ```
 
-> ✅ **已验证可用**（2026-10-29）
-> - 模型 `qwen3.8-omni-flash-realtime`，音色 `Tina`，区域 `cn-beijing`
-> - `check_qwen.py` 全绿：鉴权通过 + `session.updated` 收到
+> **出问题先跑自检**。它只连一次、不发音频，能把"配置错"和"代码错"分开。
+> 常见结果：`HTTP 401` = 密钥错；配置项没填 = 会明确指出来。
 
 ### ⚠️ 外放 vs 耳机：回声自问自答问题
 
@@ -52,24 +61,20 @@ cp .env.example .env
 服务端 VAD 误判为"用户在说话"，于是 AI 回应自己 → 死循环。
 （官方文档也确认 WebSocket 协议**不含回声消除/降噪**，需客户端自行处理。）
 
-**已内置对策**：`realtime_qwen.py` 默认开启**回声抑制**，但不是简单静音 ——
-它用"播放时间轴对齐"来预测麦克风此刻会收到多少回声，只有当你明显比回声更响时
-才判定为打断。**所以外放时你也能随时插话。**
+**已内置对策**：网页版通过浏览器的 `getUserMedia` 开启
+**回声消除（echoCancellation）+ 降噪（noiseSuppression）+ 自动增益（autoGainControl）**，
+并向服务端汇报「AI 正在说话」，这段时间不判定用户语音 —— 所以外放时也能随时插话。
 
-```bash
-.venv/bin/python realtime_qwen.py --topic "travel plans"                 # 外放（默认）
-.venv/bin/python realtime_qwen.py --topic "travel plans" --headphone     # 戴耳机，最灵敏
-.venv/bin/python realtime_qwen.py --topic "travel plans" --barge-in 1.3  # 打断更灵敏
-```
+这三项目前是写死的（见 `app/web/index.html` 的 `startMic`），不建议关：
 
-| 参数 | 用途 |
+| 关掉哪项 | 后果 |
 |---|---|
-| （默认） | 外放 + 回声抑制，**可以打断** |
-| `--headphone` | 戴耳机，本地抢先打断，**最灵敏** |
-| `--barge-in N` | 外放打断灵敏度，默认 1.6。调小=更容易打断 |
-| `--barge-floor RMS` | 打断音量下限，默认 350。**正常音量打不断→调小** |
-| `--vad-threshold F` | 服务端 VAD 灵敏度，默认 0.5。调小=更容易判定你在说话 |
-| `--vad-silence MS` | 判你说完的静音时长，默认 800。调小=响应更快 |
+| `echoCancellation` | AI 听见自己 → 自问自答 |
+| `autoGainControl` | 音量过低 → VAD 不触发 → 感觉变慢 |
+| `noiseSuppression` | 影响声纹判定（三项目中对声纹影响最大的一个） |
+
+> 原型期的命令行版本（`realtime_qwen.py`）有 `--headphone` / `--barge-in` 等参数，
+> 那些已随原型冻结，见 `prototype/`。**当前的网页版没有这些开关。**
 
 ### 🎙️ 声纹过滤：只认你的声音
 
@@ -365,7 +370,7 @@ md5 models/campplus.onnx           # 应为 2ac7673f702e6e45ff45882a4dd55b1a
 F12 就能拿走。所以必须有后端持有密钥：
 
 ```
-浏览器 ──WebSocket──> server.py ──(持key)──> Qwen Realtime
+浏览器 ──WebSocket──> app/api/server.py ──(持key)──> Qwen Realtime
                           │
                           └─ 声纹过滤（判断是不是本人在说）
 ```
@@ -381,21 +386,21 @@ F12 就能拿走。所以必须有后端持有密钥：
 | 自动增益 AGC | ❌ 无 | ✅ 内置 |
 
 命令行版那套回声标定、动态阈值调参，在网页版**完全不需要** ——
-是平台的免费能力。所以 `server.py` 里没有这些逻辑。
+是平台的免费能力。所以服务端里没有这些逻辑。
 
 ### 跑起来
 
 ```bash
 # 电脑上（浏览器只在 localhost 下允许麦克风）
-.venv/bin/python server.py
+.venv/bin/python -m app
 # 打开 http://127.0.0.1:8000
 ```
 
 **手机/平板用**（需 HTTPS，否则浏览器拒绝开麦）：
 
 ```bash
-.venv/bin/python make_cert.py                   # 生成自签证书（只需一次）
-.venv/bin/python server.py --host 0.0.0.0 --ssl
+.venv/bin/python scripts/make_cert.py           # 生成自签证书（只需一次）
+.venv/bin/python -m app --host 0.0.0.0 --ssl
 # 手机访问 https://<你的局域网IP>:8000
 # 首次会提示证书不受信任 → 高级 → 继续前往
 ```
