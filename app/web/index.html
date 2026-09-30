@@ -492,8 +492,6 @@ function onServer(ev) {
     if (names) toast("记住了：" + names, 3200);
   } else if (m.type === "voiceprint_skip") {
     $("sBlocked").textContent = m.blocked_sec + " 秒";
-  } else if (m.type === "voiceprint_stuck") {
-    toast("声纹暂时无法判断，已先放行", 3000);
   } else if (m.type === "tick") {
     elapsedBefore = m.elapsed_sec || 0;
     updateStats(m);

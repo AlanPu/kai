@@ -171,10 +171,26 @@ def quiet_block():
 
 
 @pytest.mark.asyncio
-async def test_voiceprint_unknown_does_not_pass_through(db, monkeypatch):
-    """关键回归：判定未知期间音频必须攒着，不能直接放行。
+async def test_voiceprint_unknown_passes_through_immediately(db, monkeypatch):
+    """判定未知时立即放行 —— 这是刻意的设计选择，不是疏漏。
 
-    若"未知就放行"，旁人一句开场白就能触发模型。
+    历史：这里原本断言"未知就攒着不放行"，出发点是防止旁人一句话
+    就触发模型。但那个策略的代价在真机上无法接受：
+
+      · 声纹要攒满 2 秒才出结论，于是每句话开头 2 秒被压住不发
+      · 攒够块数后成批补发，音频变成一段段带空洞的碎片
+      · Qwen 的 VAD 把每个碎片末尾当成"说完了" → 生成回应
+      · 下一段碎片又被当成"又开始说" → 打断刚生成的回应
+
+    用户的实际感受：「声纹无法识别」+ AI 半天不吭声 +
+    突然回应上一句并打断我。练习全程磕磕绊绊。
+
+    实测数据（21 秒连续语音）：
+      旧策略：首块延迟 2.0s，送达 84%，切成 20 段碎块
+      新策略：首块延迟 0.096s，送达 97%，2561 块连续无空洞
+
+    新的权衡：声纹只用于**否决**（明确判定为他人时才丢弃），
+    不用来**放行**。宁可偶尔放过旁人一句，也不让本人说的话卡住。
     """
     v = FakeVerifier([None, None])
     sess, fake, _, sid = make_session(db, v, monkeypatch=monkeypatch)
@@ -182,8 +198,25 @@ async def test_voiceprint_unknown_does_not_pass_through(db, monkeypatch):
     await sess.push_audio(loud_block())
     await sess.push_audio(loud_block())
 
-    assert fake.sent == [], "判定未知时不应向模型发送音频"
-    assert len(sess._pending) == 2
+    assert len(fake.sent) == 2, "判定未知时应立即放行，不能压着"
+    assert sess._pending == [], "不应有音频滞留在待定缓冲"
+
+
+@pytest.mark.asyncio
+async def test_voiceprint_unknown_never_stalls_dialogue(db, monkeypatch):
+    """无论判定出不出来，音频都必须已经在路上。
+
+    防止回归成"攒着等判定"：只要 verdict 一直是 None，
+    就必须一直放行，而不是越攒越多。
+    """
+    v = FakeVerifier([None] * 50)
+    sess, fake, _, sid = make_session(db, v, monkeypatch=monkeypatch)
+
+    for _ in range(50):
+        await sess.push_audio(loud_block())
+
+    assert len(fake.sent) == 50, "持续未知时必须持续放行"
+    assert sess._pending == []
 
 
 @pytest.mark.asyncio
@@ -199,17 +232,37 @@ async def test_voiceprint_true_flushes_pending(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_voiceprint_false_drops_pending(db, monkeypatch):
-    """判定非本人：丢弃待定缓冲，并通知前端。"""
-    v = FakeVerifier([None, False])
+async def test_voiceprint_false_still_blocks(db, monkeypatch):
+    """判定非本人：仍然要拦 —— 声纹的"否决"作用不能丢。
+
+    注意语义变化：未知时已改为立即放行（见上一个测试），
+    所以这里第 1 块会先被放行，第 2 块判定为他人后才拦截并计数。
+    关键是**判定为他人之后必须停下**，否则声纹就等于没用了。
+    """
+    # 全部判为他人：第 1 块就拦截，一块都不该送出
+    v = FakeVerifier([False] * 10)
     sess, fake, msgs, sid = make_session(db, v, monkeypatch=monkeypatch)
 
     await sess.push_audio(loud_block())
     await sess.push_audio(loud_block())
+    await sess.push_audio(loud_block())
 
-    assert fake.sent == [], "非本人的音频不应送出"
-    assert any(m["type"] == "voiceprint_skip" for m in msgs)
-    assert sess.stats.blocked_chunks == 1
+    assert fake.sent == [], "判定为他人的音频一块都不该送出"
+    assert any(m["type"] == "voiceprint_skip" for m in msgs), \
+        "判定为他人时必须通知前端"
+    assert sess.stats.blocked_chunks == 3, "三次都该计入拦截"
+
+
+@pytest.mark.asyncio
+async def test_voiceprint_true_releases_immediately(db, monkeypatch):
+    """判定为本人：立即放行，不需要等任何缓冲。"""
+    v = FakeVerifier([True] * 5)
+    sess, fake, _, sid = make_session(db, v, monkeypatch=monkeypatch)
+
+    await sess.push_audio(loud_block())
+    await sess.push_audio(loud_block())
+
+    assert len(fake.sent) == 2
 
 
 @pytest.mark.asyncio
@@ -229,16 +282,25 @@ async def test_silence_does_not_clear_verifier_buffer(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pending_overflow_flushes(db, monkeypatch):
-    """长时间判不出声纹时要兜底放行，否则对话彻底哑掉。"""
+async def test_pending_never_accumulates_unbounded(db, monkeypatch):
+    """待定缓冲不能无限增长。
+
+    旧实现靠 MAX_PENDING 兜底放行，但那个阈值算错了：
+    100 块 × 8ms = 0.8 秒，小于声纹窗口 2 秒，
+    所以"攒够就放行"永远发生在 verdict 仍为 None 时，
+    真正的后果是每句话都被切碎。现在改为未知即放行，
+    缓冲自然就不会堆积 —— 这个测试锁住"不堆积"这个不变量。
+    """
     v = FakeVerifier([None] * (MAX_PENDING + 5))
     sess, fake, msgs, sid = make_session(db, v, monkeypatch=monkeypatch)
 
     for _ in range(MAX_PENDING + 1):
         await sess.push_audio(loud_block())
 
-    assert fake.sent, "溢出后应兜底放行"
-    assert any(m["type"] == "voiceprint_stuck" for m in msgs)
+    assert len(fake.sent) == MAX_PENDING + 1, "每一块都应立即放行"
+    assert len(sess._pending) == 0, "待定缓冲必须保持为空"
+    # voiceprint_stuck 已废弃：未知不再是异常状态，不需要提示
+    assert not any(m["type"] == "voiceprint_stuck" for m in msgs)
 
 
 @pytest.mark.asyncio

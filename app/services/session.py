@@ -55,8 +55,13 @@ AUDIO_ITEM_ROTATE_AT = 60
 
 # 静音门槛（int16 量级）：低于此值不送声纹判定，但仍积累在待定缓冲
 VOICE_RMS_FLOOR = 120
-# 待定缓冲上限（约 4 秒）：防止声纹长时间判不出来导致对话哑掉
-MAX_PENDING = 100
+# 浏览器 AudioWorklet 每块 128 采样 @16kHz = 8ms。
+# 用于把"块数"换算成秒数来统计丢弃时长。
+CHUNK_SEC = 128 / 16000
+# 待定缓冲上限（约 4 秒）。只用于静音段的裁剪：
+# 判不出来的音频现在会立即放行，不再靠这个阈值兜底。
+# 按 8ms/块算，500 块 ≈ 4 秒。
+MAX_PENDING = 500
 
 
 @dataclass
@@ -239,20 +244,35 @@ class ConversationSession:
             verdict = self.verifier.feed(arr.astype(np.float32))
 
             if verdict is None:
-                self._pending.append(pcm)
-                if len(self._pending) >= MAX_PENDING:
-                    # 兜底：长时间判不出来就放行，否则对话会彻底哑掉
-                    await self._flush_pending()
-                    await self.on_client({
-                        "type": "voiceprint_stuck",
-                        "sec": round(len(self._pending) * 0.02, 1)})
-                else:
-                    self._trim_pending()
+                # ⚠️ 判定还没出来 —— 这是最常见的状态，不是异常。
+                #
+                # 声纹要攒满 window_sec（2 秒）才能算一次，所以每句话的
+                # 前 2 秒必然落在"未知"里。此处曾经把音频压着不发（攒够
+                # MAX_PENDING 才兜底），后果很严重：
+                #
+                #   · 用户开口后最多 2 秒，Qwen 完全收不到声音
+                #   · 攒够块数后一次性成批补发，音频变成一段段带空洞的
+                #     碎片送给 Qwen
+                #   · Qwen 的 VAD 把每个碎片末尾当成"说完了" → 生成回应
+                #   · 下一个碎片又被当成"又开始说" → 打断刚生成的回应
+                #
+                # 用户看到的就是：「声纹无法识别」+ AI 半天不吭声 +
+                # 突然回应上一句并把我打断。全都来自这一处。
+                #
+                # 顺带一提，原来的兜底阈值也算错了：MAX_PENDING=100 块
+                # × 8ms(浏览器块大小) = 0.8 秒 < 2 秒声纹窗口，所以
+                # "攒够就放行"永远发生在 verdict 仍为 None 的时候。
+                #
+                # 现在改成：判不出来就直接放行。声纹只用来否决
+                # （明确判定为他人时才丢），而不是用来放行 ——
+                # 宁可放过，也不要让本人说的话卡住。
+                await self._flush_pending()
+                await self._send_audio(pcm)
                 return
 
             if verdict is False:
                 # 不是本人 → 丢弃全部待定音频
-                dropped = len(self._pending) * 0.02 + 0.02
+                dropped = len(self._pending) * CHUNK_SEC + CHUNK_SEC
                 self._pending.clear()
                 self.stats.blocked_chunks += 1
                 self.stats.blocked_sec += dropped
