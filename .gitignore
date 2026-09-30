@@ -16,6 +16,13 @@ data/
 !data/.gitkeep
 voiceprint.json
 *.wav
+*.db
+*.sqlite
+*.sqlite3
+
+# 导出物 / 临时产物
+exports/
+*.log
 
 # ---- 原型（冻结，不纳入新工程版本管理）----
 prototype/

@@ -9,8 +9,19 @@
 
 import asyncio
 import json
+import pathlib
 
 import pytest
+
+# 仓库根目录。测试里要读源码做断言，但不能硬编码绝对路径 ——
+# 那会把开发者的用户名写进版本库（公开仓库不该暴露），
+# 换台机器或换个目录也会直接挂掉。
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def read_src(*parts: str) -> str:
+    """读取仓库内某个源文件的内容。"""
+    return ROOT.joinpath(*parts).read_text()
 
 from app.services.cost import (DEFAULT_PRICE, TEXT_PRICE, Usage,
                                estimate_cost, format_usage,
@@ -548,10 +559,7 @@ def test_recoverable_is_checked_before_fatal():
     消息里才带 Too many audios。若先判 is_fatal_error，
     会被当成致命错误直接结束会话 —— 顺序不能反。
     """
-    import pathlib
-    src = pathlib.Path(
-        "./app/services/session.py"
-    ).read_text()
+    src = read_src("app", "services", "session.py")
     i_rec = src.index("is_recoverable_error(msg)")
     i_fat = src.index("is_fatal_error(code)")
     assert i_rec < i_fat, "可恢复判断必须先于致命判断"
@@ -634,10 +642,7 @@ def test_wants_rotate_is_consumed_once():
 
     否则 timer 循环每 5 秒重试，一次会话里会反复重连。
     """
-    import pathlib
-    src = pathlib.Path(
-        "./app/services/session.py"
-    ).read_text()
+    src = read_src("app", "services", "session.py")
     i = src.index("async def rotate_context")
     body = src[i:i + 900]
     assert "_want_rotate = False" in body, "进入轮转时应先清标志"
@@ -772,11 +777,7 @@ def test_quota_message_is_actionable():
     只说「额度不足」，用户只能一脸茫然地反复重试 ——
     免费额度用完后需要去控制台充值或关掉「仅用免费额度」。
     """
-    import pathlib
-
-    src = pathlib.Path(
-        "./app/api/server.py"
-    ).read_text()
+    src = read_src("app", "api", "server.py")
     i = src.index("语音模型的免费额度用完了")
     msg = src[i:i + 200]
     assert "免费额度" in msg
@@ -821,11 +822,7 @@ def test_recv_task_has_done_callback():
     SessionFatal 只会静静存在 task 对象里，永远没人发现 ——
     这正是「服务端已死、程序又空转 24 分钟」的根因。
     """
-    import pathlib
-
-    src = pathlib.Path(
-        "./app/core/realtime.py"
-    ).read_text()
+    src = read_src("app", "core", "realtime.py")
     i = src.index("self._recv_task = asyncio.create_task(self._recv_loop())")
     tail = src[i:i + 400]
     assert "add_done_callback" in tail, "接收任务必须挂 done 回调"
@@ -840,11 +837,7 @@ def test_fatal_error_reaches_client_as_aborted():
     只以普通 error 出现，用户看到「莫名其妙结束了」，
     也不知道该去充值还是重试。
     """
-    import pathlib
-
-    src = pathlib.Path(
-        "./app/api/server.py"
-    ).read_text()
+    src = read_src("app", "api", "server.py")
     assert '"type": "aborted"' in src, "服务端必须发 aborted（前端在等它）"
     assert "_fatal_message(fatal)" in src, "aborted 要带人能看懂的原因"
 
@@ -856,16 +849,10 @@ def test_connection_loss_is_detected():
     没有这个判断，timer 循环会一直发 tick ——
     用户对着一个死连接说话而界面毫无异常。
     """
-    import pathlib
-
-    src = pathlib.Path(
-        "./app/services/session.py"
-    ).read_text()
+    src = read_src("app", "services", "session.py")
     assert "def is_connection_lost" in src
 
-    srv = pathlib.Path(
-        "./app/api/server.py"
-    ).read_text()
+    srv = read_src("app", "api", "server.py")
     assert "is_connection_lost()" in srv, "timer 循环要看护连接存活"
 
 
@@ -915,11 +902,7 @@ def test_main_supports_https():
     文档里一度写着 --ssl-keyfile，但代码根本没实现 ——
     照着文档做只会启动失败。这个测试防止再出现这种不一致。
     """
-    import pathlib
-
-    src = pathlib.Path(
-        "./app/__main__.py"
-    ).read_text()
+    src = read_src("app", "__main__.py")
     assert "--ssl" in src
     assert "ssl_certfile" in src and "ssl_keyfile" in src
     assert "uvicorn.run" in src
@@ -929,11 +912,7 @@ def test_main_reports_missing_cert_clearly():
     """
     证书缺失要给出可操作的提示，而不是抛一堆堆栈。
     """
-    import pathlib
-
-    src = pathlib.Path(
-        "./app/__main__.py"
-    ).read_text()
+    src = read_src("app", "__main__.py")
     assert "make_cert.py" in src, "要告诉用户怎么生成证书"
 
 
@@ -945,14 +924,8 @@ def test_docs_match_reality():
     但 app/__main__.py 当时只有 --host/--port/--reload，
     照文档做会直接启动失败。
     """
-    import pathlib
-
-    doc = pathlib.Path(
-        "./docs/使用说明.md"
-    ).read_text()
-    code = pathlib.Path(
-        "./app/__main__.py"
-    ).read_text()
+    doc = read_src("docs", "使用说明.md")
+    code = read_src("app", "__main__.py")
 
     for flag in ("--ssl", "--host"):
         if flag in doc:

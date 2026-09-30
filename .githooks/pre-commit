@@ -1,0 +1,4 @@
+#!/bin/sh
+# 提交前拦截个人数据 —— 这个仓库是公开的。
+# 启用方式：git config core.hooksPath .githooks
+exec python3 scripts/check_public_safe.py

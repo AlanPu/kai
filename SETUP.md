@@ -32,7 +32,7 @@
 ### 三步跑起来
 
 ```bash
-cd .
+cd kai          # 进到本项目目录
 cp .env.example .env
 # 编辑 .env，填 DASHSCOPE_API_KEY 和 QWEN_WORKSPACE_ID
 
@@ -362,7 +362,7 @@ F12 就能拿走。所以必须有后端持有密钥：
 | 页面加载 | ✅ HTTP 200，含 AudioWorklet/getUserMedia |
 | 浏览器↔服务端↔Qwen 建连 | ✅ 收到 `ready` |
 | **真实语音端到端** | ✅ 转写正确 → 模型回复 → 音频回传 24 块 |
-| **HTTPS/WSS 手机路径** | ✅ 通过 `wss://<your-ip>:8443` 全链路通 |
+| **HTTPS/WSS 手机路径** | ✅ 通过 `wss://<你的电脑IP>:8443` 全链路通 |
 | 声纹拦截 | ✅ 不匹配语音上行块=0；关闭声纹后正常放行 |
 
 ### 技术要点（踩过的坑）
@@ -420,7 +420,7 @@ to the Azure OpenAI Service.
 
 > **中国大陆地区，只有持有营业执照的企业客户**才能订阅 Azure OpenAI 服务。
 
-**三个资源、全部模型都试过，一律返回同一个错误。** 个人账号（`16343945+AlanPu@users.noreply.github.com`，Individual / MicrosoftCustomerAgreement）**无法通过任何配额申请绕开**——这不是"额度不够"，是"身份不符合准入条件"。
+**三个资源、全部模型都试过，一律返回同一个错误。** 个人账号（Individual / MicrosoftCustomerAgreement）**无法通过任何配额申请绕开**——这不是"额度不够"，是"身份不符合准入条件"。
 
 **官方给出的唯一正规途径**：
 - 联系微软认证合作伙伴 https://azure.microsoft.com/zh-cn/partners/
@@ -483,7 +483,7 @@ to the Azure OpenAI Service.
 ## 二、本地配置
 
 ```bash
-cd .
+cd kai          # 进到本项目目录
 cp .env.example .env
 # 编辑 .env，填入三个值
 ```
