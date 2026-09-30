@@ -51,10 +51,10 @@ WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
 # 冷场多久之后 AI 主动找话题（秒）。
 #
-# 20 秒是权衡的结果：真人对话里这个长度刚好是"对方在等你开口"，
+# 15 秒是权衡的结果：真人对话里这个长度刚好是"对方在等你开口"，
 # 再长就像冷场，再短就变成催促 —— 而用户需要时间组织英文句子，
 # 催太紧反而说不出来。
-IDLE_NUDGE_SEC = 20.0
+IDLE_NUDGE_SEC = 15.0
 
 app = FastAPI(title="英语口语陪练")
 _settings: Optional[Settings] = None

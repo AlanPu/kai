@@ -1265,3 +1265,26 @@ def test_frontend_enables_push_to_talk_gate():
     # 置位要发生在麦克风启动流程里（worklet 绑定之前）
     assert html.index("pttActive = true") < html.index("worklet.port.onmessage"), \
         "应在启用 worklet 消息处理前就打开闸门"
+
+
+def test_idle_nudge_threshold_is_15_seconds():
+    """冷场阈值固定为 15 秒。
+
+    这个值调过两次意见：最初定 20 秒，用户实际用下来觉得偏长
+    （"现在 20 秒好像有点长了"），改成 15 秒。
+
+    钉住它是因为这个值同时出现在三个地方 —— server.py 的
+    IDLE_NUDGE_SEC 常量，以及 session.py 里 maybe_nudge/nudge
+    的默认参数。三处不一致会导致"改了没生效"，很难查。
+    """
+    import inspect
+
+    from app.api.server import IDLE_NUDGE_SEC
+    from app.services.session import ConversationSession
+
+    assert IDLE_NUDGE_SEC == 15.0, f"冷场阈值应为 15 秒，实际 {IDLE_NUDGE_SEC}"
+
+    for fn in (ConversationSession.maybe_nudge, ConversationSession.nudge):
+        default = inspect.signature(fn).parameters["threshold"].default
+        assert default == IDLE_NUDGE_SEC, \
+            f"{fn.__name__} 的默认值({default})与 IDLE_NUDGE_SEC({IDLE_NUDGE_SEC}) 不一致"
