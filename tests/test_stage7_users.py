@@ -691,3 +691,42 @@ def test_db_usable_from_other_threads(tmp_path):
     t.join()
     assert not err, f"跨线程访问数据库失败: {err[0]}"
     db.close()
+
+
+def test_enroll_ws_accepts_frontend_command_shape():
+    """录入 WebSocket 必须认前端真实发的指令格式。
+
+    前端发的是 {"type": "end"}，而历史上服务端只读 cmd.get("cmd")，
+    于是网页上点「读完了」被静默忽略 —— 不报错、不回应，
+    用户看到的就是"点了没反应"。用脚本测试却一切正常，
+    因为脚本当时发的是 {"cmd": "end"}：测试验证的是一套
+    应用根本不会发的协议。
+
+    这个测试直接对着 app/api/server.py 的源码断言两种格式都被接受，
+    避免再出现"测试绿、真机坏"。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "api" / "server.py").read_text(encoding="utf-8")
+    m = re.search(r"^\s*action = \(.*\)\.strip\(\)", src, re.M)
+    assert m, "没找到 ws_enroll 里解析指令的那一行"
+    line = m.group(0)
+    assert 'cmd.get("cmd")' in line, "应接受前端的 type 格式之外，也保留 cmd"
+    assert 'cmd.get("type")' in line, \
+        "必须接受前端实际发送的 {\"type\": ...} 格式，否则点「读完了」无效"
+
+
+def test_frontend_enroll_commands_use_type_field():
+    """前端发的录入指令用的是 type 字段（与上面的断言配对）。"""
+    import re
+    from pathlib import Path
+
+    html = (Path(__file__).resolve().parent.parent
+            / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    sends = re.findall(r"enrollWs\.send\(JSON\.stringify\(\{([^}]*)\}\)\)", html)
+    assert sends, "前端没有发任何录入指令？"
+    for s in sends:
+        assert "type:" in s, f"前端指令应带 type 字段，实际: {s}"
+        assert "cmd:" not in s, f"前端不应使用 cmd 字段，实际: {s}"

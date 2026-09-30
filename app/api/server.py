@@ -790,7 +790,11 @@ async def ws_enroll(ws: WebSocket):
                 cmd = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            action = (cmd.get("cmd") or "").strip()
+            # 前端发的是 {"type": "end"}，早期脚本发的是 {"cmd": "end"}。
+            # 两个都认 —— 曾经只认 "cmd"，导致网页上点「读完了」
+            # 被静默忽略（不报错、不回应，看起来就是"点了没反应"），
+            # 而用脚本测试却一切正常，因为脚本发的是 "cmd"。
+            action = (cmd.get("cmd") or cmd.get("type") or "").strip()
 
             if action == "cancel":
                 await ws.send_json({"type": "enroll_cancelled"})
