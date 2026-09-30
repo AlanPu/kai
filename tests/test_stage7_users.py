@@ -789,3 +789,49 @@ def test_respond_after_turn_waits_before_creating_response():
         "commit 与 response.create 之间缺少等待"
     assert body.index("commit_audio") < body.index("request_response"), \
         "必须先 commit 再 request_response"
+
+
+def test_invalid_request_error_is_not_fatal():
+    """invalid_request_error 不该是致命错误。
+
+    它太笼统了：像"commit 空缓冲"这种客户端小失误也归到这一类。
+    曾经把它列为致命，导致 VAD 一次误触发就把整场会话打死，
+    用户看到「会话被服务端中断（invalid_request_error）」——
+    但其实服务端连接还好好的，继续对话完全没问题。
+    """
+    from app.core.realtime import is_fatal_error
+
+    assert not is_fatal_error("invalid_request_error"), \
+        "invalid_request_error 不应致命（会误杀正常会话）"
+    # 真正不可恢复的必须仍然是致命
+    for code in ("user_idle_timeout", "invalid_api_key",
+                 "insufficient_quota", "session_expired"):
+        assert is_fatal_error(code), f"{code} 应当仍是致命错误"
+
+
+def test_speech_stopped_does_not_commit_without_audio():
+    """没送过音频就不能 commit —— commit 空缓冲会报错。
+
+    实测服务端返回：
+      "Error committing input audio buffer: buffer too small,
+       or have no audio."
+    而 VAD 对咳嗽、碰麦、键盘声都会报 speech_stopped，
+    所以必须靠标志位区分"真的说了话"和"VAD 误触发"。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "services" / "session.py").read_text(encoding="utf-8")
+    assert "_sent_audio_since_commit" in src, "缺少空缓冲保护标志"
+
+    # 该标志必须在 speech_stopped 分支里被检查
+    seg = src[src.index("if is_speech_stopped(ev):"):]
+    seg = seg[:seg.index("if t == \"response.created\"")]
+    assert "_sent_audio_since_commit" in seg, \
+        "speech_stopped 分支没有检查是否真的送过音频"
+
+    # 送音频时要置位
+    send = src[src.index("async def _send_audio"):]
+    send = send[:send.index("async def _on_qwen_event")]
+    assert "_sent_audio_since_commit = True" in send, \
+        "_send_audio 没有置位标志，保护会永远不生效"

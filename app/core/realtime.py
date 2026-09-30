@@ -70,7 +70,13 @@ FATAL_CODES = {
     "invalid_api_key",
     "insufficient_quota",
     "rate_limit_exceeded",
-    "invalid_request_error",
+    # 这里曾经有 invalid_request_error，已移除。
+    #
+    # 它太笼统了：像 "commit 空缓冲" 这种客户端小失误也归到这一类，
+    # 结果一次误触发就把整场会话打死（用户看到「会话被服务端中断」）。
+    # 实际上服务端并没有关闭连接，继续对话完全没问题 ——
+    # 属于本可恢复的错误，走 is_recoverable_error 提示一下即可。
+    # 真正不可恢复的（额度、鉴权、会话过期）上面已单独列出。
 }
 
 

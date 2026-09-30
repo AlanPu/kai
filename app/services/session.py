@@ -135,6 +135,10 @@ class ConversationSession:
         self._model_speaking = False
         # 用户当前是否正在说话（由服务端 VAD 的 started/stopped 维护）
         self._user_speaking = False
+        # 上次 commit 之后是否真的送过音频。
+        # commit 空缓冲会让服务端报 invalid_request_error 并打死会话，
+        # 所以要靠这个标志区分「用户真的说了话」和「VAD 误触发」。
+        self._sent_audio_since_commit = False
         self._user_buf: list[str] = []
         self._correction_tasks: set[asyncio.Task] = set()
 
@@ -277,6 +281,10 @@ class ConversationSession:
         assert self.rt
         await self.rt.send_audio(pcm)
         self.stats.audio_in_blocks += 1
+        # 记下"自上次 commit 以来确实有音频"，
+        # 供 speech_stopped 判断是否值得 commit（见该处注释）
+        if pcm:
+            self._sent_audio_since_commit = True
 
     # ---------- 事件处理 ----------
 
@@ -362,8 +370,18 @@ class ConversationSession:
             # 延迟：commit 之后不能立刻 response.create，要等服务端把
             # 音频 item 落库（实测 0.4~0.6 秒）。发太早会被忽略，
             # 现象和没修一样 —— 这里踩过。
+            #
+            # ⚠️ commit 空缓冲是硬错误，不是无操作：
+            #     "Error committing input audio buffer: buffer too small,
+            #      or have no audio."
+            # 而 code 是 invalid_request_error，在 FATAL_CODES 里，
+            # 会直接把整场会话打死（用户看到「会话被服务端中断」）。
+            # VAD 对一声咳嗽、一次碰麦、键盘声都可能报 speech_stopped，
+            # 所以必须确认真的送过音频才 commit。
             self._user_speaking = False
-            asyncio.create_task(self._respond_after_turn())
+            if self._sent_audio_since_commit:
+                self._sent_audio_since_commit = False
+                asyncio.create_task(self._respond_after_turn())
             return
 
         if t == "response.created":
