@@ -841,16 +841,94 @@ def test_respond_after_turn_waits_before_creating_response():
         "不应再手动 commit（服务端已自行 commit，重复提交会报 buffer too small"
 
 
-def test_realtime_has_no_commit_audio():
-    """commit_audio 已废弃：服务端在 speech_stopped 时自己 commit。
+@pytest.mark.asyncio
+async def test_turn_end_commits_then_responds():
+    """松手时必须先显式提交音频，再让 AI 接话。
 
-    我们再做一次就是空提交，服务端回
-    "buffer too small, or have no audio"。
+    历史（两次踩坑，方向正好相反，别再改回去）：
+
+      · 最初每次 speech_stopped 都 commit —— 但服务端 VAD 已经自己
+        commit 过了，我们这次成了空提交，服务端回
+        "buffer too small, or have no audio"。
+      · 于是彻底删掉 commit，改成完全依赖 VAD 自动提交。
+        加上「按住空格说话」之后这条不再成立：实测送上去 3 秒音频
+        （30 块），转写始终不出现，紧接着 response.create 也被静默
+        吞掉 —— 用户感受就是"我说完 AI 不理我"。
+
+    现在的语义：**松开空格 = 明确的提交信号**，且只在确实发过音频
+    时才提交（没发过就跳过，避免空提交）。
+
+    这里用真实的假对象跑行为，而不是检查源码文本 ——
+    文本断言会被注释里的同名字样骗过（这个文件踩过一次）。
     """
+    from app.services.session import ConversationSession, SessionStats
+
+    calls: list[str] = []
+
+    class FakeRT:
+        async def send_audio(self, b):
+            calls.append("append")
+
+        async def commit_audio(self):
+            calls.append("commit")
+
+        async def request_response(self, instructions=None):
+            calls.append("create")
+
+    def make(turn_blocks: int):
+        s = ConversationSession.__new__(ConversationSession)
+        s.ended = False
+        s.paused = False
+        s.rt = FakeRT()
+        s.stats = SessionStats()
+        s._pending = []
+        s._model_speaking = False
+        s._response_pending = False
+        s._response_pending_at = 0.0
+        s.response_pending_timeout = 12.0
+        s._bg_tasks = set()
+        s._turn_audio_blocks = turn_blocks
+        s._on_user_text = lambda *a, **k: None
+        return s
+
+    # 情形 1：本轮说过话 → 必须先 commit 再 create
+    calls.clear()
+    s = make(30)
+    await ConversationSession.end_turn(s)
+    import asyncio
+
+    assert "commit" in calls, "本轮发过音频却没提交（就是'AI 不理我'那个 bug）"
+    # 接话是后台任务延迟触发的（要等服务端把音频 item 落库），
+    # 这里等它落地再断言顺序。
+    await asyncio.sleep(0.8)
+    assert "create" in calls, "提交后必须触发接话"
+    assert calls.index("commit") < calls.index("create"), \
+        f"必须先提交再接话，实际顺序 {calls}"
+
+    # 情形 2：本轮没说话 → 不能空提交，也不该让 AI 对空气回应
+    calls.clear()
+    s = make(0)
+    await ConversationSession.end_turn(s)
+    assert calls == [], f"空轮不该提交也不该接话，实际 {calls}"
+
+
+def test_commit_audio_exists_and_only_commits():
+    """commit_audio 恢复存在，但只发 commit、不再做别的。"""
+    import inspect
+
     from app.core.realtime import RealtimeSession
 
-    assert not hasattr(RealtimeSession, "commit_audio"), \
-        "commit_audio 应已删除，否则会诱导再次写出空提交"
+    assert hasattr(RealtimeSession, "commit_audio"), \
+        "commit_audio 应存在（松手时显式提交本轮音频）"
+    src = inspect.getsource(RealtimeSession.commit_audio)
+    # 先剥掉注释和 docstring：解释性文字里提到 "response.create"
+    # 会让"不应调用"的断言误判（这个文件已经踩过一次）。
+    import re
+    src = re.sub(r'"""[\s\S]*?"""', "", src)
+    src = re.sub(r"#[^\n]*", "", src)
+    assert "input_audio_buffer.commit" in src
+    assert "response.create" not in src, \
+        "commit 不应顺带触发回应，两件事要分开"
 
 
 def test_turn_race_errors_are_recognized():
@@ -985,3 +1063,148 @@ def test_audio_output_context_is_recovered():
     enq = src[src.index("function enqueueAudio"):]
     enq = enq[:enq.index("function stopPlayback")]
     assert "ensureOutCtx()" in enq, "enqueueAudio 应通过 ensureOutCtx 取上下文"
+
+
+# ---------- 冷场救场 ----------
+#
+# 改成「按住空格说话」之后，回合完全由用户发起 —— 用户不开口，
+# AI 就永远不说话。卡住想不出句子时会一直干等，练习停在那里。
+# 所以冷场够久要让 AI 主动找话题。
+
+
+def test_idle_nudge_fires_after_threshold():
+    """冷场超过阈值时，AI 应主动开口。"""
+    import time as _t
+
+    from app.services.session import ConversationSession
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.ended = False
+    s.paused = False
+    s.rt = object()
+    s._model_speaking = False
+    s._response_pending = False
+    s._nudges_sent = 0
+    s._max_nudges = 6
+    s._last_activity = _t.time()
+
+    assert s.maybe_nudge(20.0) is None, "刚活动过不该催"
+
+    s._last_activity = _t.time() - 25
+    instr = s.maybe_nudge(20.0)
+    assert instr, "冷场 25 秒应触发主动找话题"
+    # 指令要明确禁止"你还在吗"这类扫兴话术
+    assert "silent" in instr.lower()
+    assert "still there" in instr.lower()
+
+
+def test_nudge_instruction_forbids_asking_if_still_there():
+    """主动找话题不能被说成"你还在吗"。"""
+    from app.services.session import ConversationSession
+
+    s = ConversationSession.__new__(ConversationSession)
+    s._nudges_sent = 1
+    first = s._nudge_instruction()
+    assert "still there" in first.lower(), "必须明确禁止追问'你还在吗'"
+
+    # 第二次起要换新话题，避免在同一点打转
+    s._nudges_sent = 3
+    later = s._nudge_instruction()
+    assert later != first, "连续冷场应换策略，而不是重复同一句"
+
+
+def test_nudge_never_interrupts_ai_speech():
+    """AI 正在说话/准备说话时绝不能插嘴。"""
+    import time as _t
+
+    from app.services.session import ConversationSession
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.ended = False
+    s.paused = False
+    s.rt = object()
+    s._nudges_sent = 0
+    s._max_nudges = 6
+    s._last_activity = _t.time() - 60      # 冷了很久
+
+    s._model_speaking = True
+    assert s.maybe_nudge(20.0) is None, "AI 正在说话时不该插嘴"
+
+    s._model_speaking = False
+    s._response_pending = True
+    assert s.maybe_nudge(20.0) is None, "已在等回应时不该重复触发"
+
+
+def test_nudge_stops_after_max():
+    """催够次数后要停下，不能无限自说自话。"""
+    import time as _t
+
+    from app.services.session import ConversationSession
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.ended = False
+    s.paused = False
+    s.rt = object()
+    s._model_speaking = False
+    s._response_pending = False
+    s._max_nudges = 2
+
+    fired = 0
+    for _ in range(5):
+        s._nudges_sent = 0
+        s._last_activity = _t.time() - 60
+        while s.maybe_nudge(20.0):
+            s._last_activity = _t.time() - 60
+            fired += 1
+            if fired > 10:
+                break
+        break
+    assert fired == 2, f"应恰好触发 {2} 次，实际 {fired}"
+
+
+def test_paused_session_never_nudges():
+    """暂停时不该催 —— 用户离开了。"""
+    import time as _t
+
+    from app.services.session import ConversationSession
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.ended = False
+    s.paused = True
+    s.rt = object()
+    s._model_speaking = False
+    s._response_pending = False
+    s._nudges_sent = 0
+    s._max_nudges = 6
+    s._last_activity = _t.time() - 300
+    assert s.maybe_nudge(20.0) is None
+
+
+def test_timer_loop_calls_nudge():
+    """冷场救场必须由 _timer_loop 轮询触发。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "api" / "server.py").read_text(encoding="utf-8")
+    assert "IDLE_NUDGE_SEC" in src, "缺少冷场阈值常量"
+    assert "sess.nudge(" in src, "_timer_loop 没有调用 nudge"
+
+
+def test_pending_response_guard_expires():
+    """等待回应的标志必须能超时作废。
+
+    实测踩过的坑：发了 response.create 但服务端根本没产生 response
+    （半句话、音频太短都会这样），response.done 永远不来，"等待中"
+    就一直挂着 —— 之后所有回合都被当成重复而静默丢弃，
+    表现为用户说什么 AI 都不理，冷场救场也一起失效。
+    """
+    import time as _t
+
+    from app.services.session import ConversationSession
+
+    s = ConversationSession.__new__(ConversationSession)
+    s._response_pending = True
+    s._response_pending_at = _t.time() - 999
+    s.response_pending_timeout = 12.0
+    assert s.response_pending() is False, \
+        "超时的等待标志必须作废，否则会话永久卡死"

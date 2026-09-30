@@ -243,15 +243,28 @@ class RealtimeSession:
         await self._send({"type": "input_audio_buffer.append",
                           "audio": base64.b64encode(pcm).decode()})
 
+    async def commit_audio(self) -> None:
+        """提交输入音频缓冲，让服务端开始转写。
+
+        ⚠️ 和历史上被删掉的版本语义不同：**调用方必须先确认真的发过音频**。
+
+        两次踩坑，方向正好相反：
+          · 最初在每次 speech_stopped 后 commit —— 但服务端 VAD
+            已经自己 commit 过了，我们这次成了空提交，服务端回
+            "buffer too small, or have no audio"，于是把它删掉了。
+          · 改成「按住空格说话」之后，前端只在按住时上行音频，
+            服务端 VAD 的自动 commit 不再可靠：实测送上去 3 秒音频
+            （30 块），转写始终不出现，紧接着 response.create 也被
+            静默吞掉 —— 用户感受就是"我说完 AI 不理我"。
+
+        所以恢复显式提交，语义收紧为：
+        **松开空格 = 明确的"我说完了"信号**，且只在确实发过音频时调用。
+        """
+        await self._send({"type": "input_audio_buffer.commit"})
+
     async def cancel_response(self) -> None:
         """打断 AI 当前回复（用户抢话时用）。"""
         await self._send({"type": "response.cancel"})
-
-    # 注：曾经有个 commit_audio() 用来自行提交输入缓冲。
-    # 已删除 —— 服务端在 speech_stopped 时会自己 commit，
-    # 我们再做一次就是空提交，服务端会回
-    # "buffer too small, or have no audio"。
-    # 详见 services/session.py 里 _maybe_respond 的注释。
 
     async def request_response(self, instructions: Optional[str] = None) -> None:
         """

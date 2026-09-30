@@ -663,6 +663,10 @@ function onServer(ev) {
                      ctxOut.state);
       }
     }
+  } else if (m.type === "ai_prompted") {
+    // AI 因为冷场主动开口了。轻提示一下，让用户知道
+    // "不是我按错了，是它在等我开口"。
+    $("duringHint").textContent = "等你开口…";
   } else if (m.type === "correction") {
     addCorrection(m);
   } else if (m.type === "profile_learned") {

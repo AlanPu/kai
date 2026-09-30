@@ -123,6 +123,18 @@ class ConversationSession:
         self.paused_total = 0.0
         self._paused_at: Optional[float] = None
 
+        # 冷场救场：用户长时间不说话时，AI 主动换个角度提问。
+        #
+        # 为什么需要：改成「按住空格说话」之后，回合完全由用户发起 ——
+        # 用户不开口，AI 就永远不会说话。安静本身没错，但用户
+        # 卡住想不出句子时会一直干等，练习就停在那里了。
+        #
+        # 20 秒这个值是权衡出来的：真人对话里这个长度刚好是
+        # "对方在等你开口"，再长就像冷场，再短就变成催促。
+        self._last_activity = time.time()
+        self._nudges_sent = 0
+        self._max_nudges = 6          # 防止 AI 自说自话刷屏
+
         self._rotate_at = AUDIO_ITEM_ROTATE_AT
         self._rotating = False
         # 由外部循环轮询：轮转必须在 recv 循环之外执行
@@ -144,7 +156,23 @@ class ConversationSession:
         # 用来去重：VAD 对同一句话会重复报 speech_stopped，
         # 重复发 response.create 会被服务端拒绝
         # （"Conversation already has an active response"）。
+        #
+        # ⚠️ 这个标志必须能超时复位。
+        # 实测踩过的坑：发了 response.create 但服务端**根本没产生
+        # response**（半句话、音频太短、空缓冲都会这样），于是
+        # response.done 永远不来，"等待中"就一直挂着 —— 之后所有回合
+        # 都被当成重复而静默丢弃，表现为用户说什么 AI 都不理，
+        # 冷场救场也一起失效。所以记录发起时刻，超时即作废。
         self._response_pending = False
+        self._response_pending_at = 0.0
+        # 本轮（本次按住空格）已经送出去的音频块数。
+        # end_turn 靠它判断"要不要 commit"：发过才提交，
+        # 没发过就不提交（空提交会被服务端拒绝）。
+        self._turn_audio_blocks = 0
+        # 请求回应后等多久算"服务端根本没理我"。
+        # 正常 response.created 在 1 秒内就回；给到 12 秒是留足
+        # 网络抖动和模型首字延迟的余量，又能保证卡死能自愈。
+        self.response_pending_timeout = 12.0
         # 后台小任务的引用集合（触发接话等），避免被 GC 提前回收
         self._bg_tasks: set[asyncio.Task] = set()
         self._user_buf: list[str] = []
@@ -227,6 +255,10 @@ class ConversationSession:
 
         if self.paused or self.ended or not self.rt:
             return
+        # 用户有动静 → 冷场计时清零。
+        # 注意这里只在"真的送音频上来"时才算：按住空格的模式下
+        # 不按空格前端根本不发数据，所以不会误把静默当活跃。
+        self.touch()
 
         # AI 说话期间不处理输入，避免自我对话
         if self._model_speaking:
@@ -304,12 +336,14 @@ class ConversationSession:
         assert self.rt
         await self.rt.send_audio(pcm)
         self.stats.audio_in_blocks += 1
+        # 用 getattr 兜底：部分测试用 __new__ 手工构造会话对象、不走
+        # __init__，属性可能不存在。
+        self._turn_audio_blocks = getattr(self, "_turn_audio_blocks", 0) + 1
 
     # ---------- 事件处理 ----------
 
     async def _on_qwen_event(self, ev: dict) -> None:
         t = ev.get("type", "")
-
         if t == "error":
             err = ev.get("error") or {}
             code = str(err.get("code") or err.get("type") or "")
@@ -376,10 +410,11 @@ class ConversationSession:
             # 正确语义：speech_started 意味着「轮到用户」，AI 要闭嘴。
             self._model_speaking = False
             self._user_speaking = True
+            self.touch()
             # 用户又开口了 —— 取消「等待回应」的挂起状态。
             # 否则上一句的 pending 会一直挂着，这一句说完时被误判为重复
             # 而不再触发接话（表现为"说了新的一句但 AI 没反应"）。
-            self._response_pending = False
+            self._clear_response_pending()
             self.stats.user_speech_starts += 1
             await self.on_client({"type": "user_speaking"})
             return
@@ -415,12 +450,16 @@ class ConversationSession:
 
         if t == "response.created":
             self._model_speaking = True
-            self._response_pending = False      # 回应已开始，允许下一次触发
+            self.touch()
+            self._clear_response_pending()      # 回应已开始，允许下一次触发
             return
 
         if t == "response.done":
             self._model_speaking = False
-            self._response_pending = False
+            self._clear_response_pending()
+            # AI 刚说完，从这一刻开始算冷场：用户若一直不开口，
+            # 20 秒后由 _timer_loop 触发主动找话题。
+            self.touch()
             # AI 说完后清空声纹缓冲，避免把自己的尾音算进判定
             if self.verifier:
                 self.verifier.reset()
@@ -447,6 +486,34 @@ class ConversationSession:
         if self.ended or not self.rt:
             return
         await self._flush_pending()
+
+        # 显式提交这一轮的音频。
+        #
+        # 必须做：前端只在按住空格时上行音频，服务端 VAD 的自动
+        # commit 变得不可靠 —— 实测送上去 3 秒音频（30 块）却始终
+        # 不出现转写，紧接着 response.create 被静默吞掉，
+        # 用户感受就是"我说完 AI 不理我"。
+        #
+        # 只在**确实发过音频**时提交：空提交会让服务端回
+        # "buffer too small, or have no audio" —— 这正是当初删掉
+        # commit_audio 的原因，不能重蹈覆辙。
+        #
+        # 判据是"本轮开始后有没有送过音频"（_turn_audio_blocks 在
+        # push_audio 里累加），而不是对比 flush 前后的计数 ——
+        # 声纹关闭时音频在 push_audio 阶段就已经直接送出去了，
+        # flush 阶段一块都没有，用差值判断会永远得 0（踩过）。
+        if getattr(self, "_turn_audio_blocks", 0) > 0:
+            try:
+                await self.rt.commit_audio()
+            except Exception as e:               # noqa: BLE001
+                log.warning("提交音频失败: %s", e)
+        else:
+            # 这一轮一个字节都没上来（按了空格但没说话）。
+            # 直接接话会让 AI 对着空气回应，所以跳过。
+            log.info("本轮没有音频，跳过接话")
+            return
+
+        self._turn_audio_blocks = 0
         self._maybe_respond()
 
     def _maybe_respond(self) -> None:
@@ -459,11 +526,11 @@ class ConversationSession:
         另外**不要**手动 commit：服务端在 speech_stopped 时已经自己
         commit 过了，我们再 commit 是空提交，会报 "buffer too small"。
         """
-        if self._response_pending:
+        if self.response_pending():
             return                       # 已经在等回应了，忽略重复触发
         if self.ended or not self.rt:
             return
-        self._response_pending = True
+        self._mark_response_pending()
         task = asyncio.create_task(self._respond_after_turn())
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
@@ -485,6 +552,7 @@ class ConversationSession:
 
     async def _on_user_text(self, text: str) -> None:
         """用户说完一句：入库、回推、异步纠错。"""
+        self.touch()
         self.stats.user_chars += len(text)
         turn_id = self.db.add_turn(Turn(session_id=self.session_id,
                                         role="user", text=text))
@@ -673,6 +741,118 @@ class ConversationSession:
             "message": "对话记忆已整理，继续聊。",
         })
         return True
+
+    # ---------- 回合状态 ----------
+
+    def response_pending(self) -> bool:
+        """是否还在等上一次回应的 response.created（带超时作废）。
+
+        超时后会把标志清掉，这样卡死的回合能自愈 ——
+        否则用户后面说什么都会被当成重复而丢弃。
+        """
+        if not self._response_pending:
+            return False
+        timeout = getattr(self, "response_pending_timeout", 12.0)
+        since = getattr(self, "_response_pending_at", 0.0)
+        # since 为 0 说明标志是外部直接置上的（没有时间戳），
+        # 这种情况按"刚刚发起"处理，不能当成已超时 ——
+        # 否则会把正在等待的回合误判成卡死。
+        if since and time.time() - since > timeout:
+            log.warning("等待 AI 回应超时（%.0f 秒无响应），作废并允许下一轮",
+                        timeout)
+            self._response_pending = False
+            return False
+        return True
+
+    def _mark_response_pending(self) -> None:
+        self._response_pending = True
+        self._response_pending_at = time.time()
+
+    def _clear_response_pending(self) -> None:
+        self._response_pending = False
+        self._response_pending_at = 0.0
+
+    # ---------- 冷场救场 ----------
+
+    def touch(self) -> None:
+        """记录"有事发生"，用于判断是否冷场。
+
+        在收到用户音频、用户转写、AI 开始/结束说话时都要调用。
+        """
+        self._last_activity = time.time()
+
+    def idle_seconds(self) -> float:
+        """距离上一次"有事发生"过了多久（暂停期间不计）。"""
+        if self.paused:
+            return 0.0
+        return time.time() - self._last_activity
+
+    def maybe_nudge(self, threshold: float = 20.0) -> Optional[str]:
+        """冷场够久了就让 AI 主动找话题。
+
+        返回要发给模型的提示语；不需要救场时返回 None。
+
+        为什么用 instructions 而不是让 AI 自由发挥：
+        直接在 response.create 里带 instructions，可以指定
+        "换个角度追问、不要把话题聊死"，否则模型容易重复上一句，
+        或者说出"你还在吗？"这种扫兴的话。
+        """
+        if self.ended or self.paused or not self.rt:
+            return None
+        if self._model_speaking or self.response_pending():
+            return None                      # AI 正在说话/准备说话，别插嘴
+        if self.idle_seconds() < threshold:
+            return None
+        if self._nudges_sent >= self._max_nudges:
+            return None                      # 已经催够了，剩下的交给用户
+
+        self._nudges_sent += 1
+        self.touch()                         # 重置计时，避免连着催
+        return self._nudge_instruction()
+
+    def _nudge_instruction(self) -> str:
+        """冷场时给模型的指令。
+
+        第 1 次温和地换个角度追问；第 2 次起主动引入新话题，
+        避免在同一个点上反复打转（那会让冷场更尴尬）。
+        """
+        common = ("The user has been silent for a while. "
+                  "Do NOT ask whether they are still there, and do not "
+                  "mention the silence or apologize. ")
+        if self._nudges_sent <= 1:
+            return (common +
+                    "Gently continue the conversation: react to what they "
+                    "said last, then ask ONE easy follow-up question from a "
+                    "slightly different angle. Keep it to one short sentence.")
+        return (common +
+                "Start a fresh but related topic that fits what you know "
+                "about them, and invite them to speak with ONE open question. "
+                "Keep it to one short sentence.")
+
+    async def nudge(self, threshold: float = 20.0) -> bool:
+        """冷场时让 AI 主动开口。返回是否真的开口了。
+
+        由 _timer_loop 每 5 秒轮询调用。放在外部循环而不是
+        Qwen 的事件回调里，是因为要发 response.create ——
+        在回调里做容易和别的事件打架。
+        """
+        # 先记下冷场时长：maybe_nudge 内部会 touch() 重置计时，
+        # 晚了就读到 0（踩过）。
+        idle = self.idle_seconds()
+        instr = self.maybe_nudge(threshold)
+        if not instr:
+            return False
+        try:
+            self._mark_response_pending()
+            await self.rt.request_response(instructions=instr)
+            await self.on_client({"type": "ai_prompted", "idle_sec": int(idle)})
+            log.info("冷场 %.0f 秒，AI 主动找话题（第 %d 次）",
+                     idle, self._nudges_sent)
+            return True
+        except Exception as e:                   # noqa: BLE001
+            self._clear_response_pending()
+            log.warning("主动找话题失败: %s", e)
+            return False
 
     # ---------- 暂停 ----------
 

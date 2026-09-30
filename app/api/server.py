@@ -49,6 +49,13 @@ logging.basicConfig(
 # server.py 在 app/api/ 下，静态页面在 app/web/
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
+# 冷场多久之后 AI 主动找话题（秒）。
+#
+# 20 秒是权衡的结果：真人对话里这个长度刚好是"对方在等你开口"，
+# 再长就像冷场，再短就变成催促 —— 而用户需要时间组织英文句子，
+# 催太紧反而说不出来。
+IDLE_NUDGE_SEC = 20.0
+
 app = FastAPI(title="英语口语陪练")
 _settings: Optional[Settings] = None
 _db: Optional[Database] = None
@@ -686,6 +693,13 @@ async def _timer_loop(ws: WebSocket, sess: ConversationSession) -> None:
         if sess.is_connection_lost():
             log.warning("检测到语音连接已断开，结束会话")
             raise SessionFatal(sess.fatal_error or "connection_closed")
+
+        # 冷场救场：改成「按住空格说话」之后回合完全由用户发起，
+        # 用户不开口 AI 就永远不说话。卡住想不出句子时会一直干等，
+        # 练习就停在那儿了 —— 所以冷场够久就让 AI 主动找话题。
+        # 放在这里（而不是 Qwen 回调里）是因为要发 response.create，
+        # 在回调里做容易和别的事件打架。
+        await sess.nudge(IDLE_NUDGE_SEC)
 
         snap = sess.snapshot()
         await sess.on_client({
