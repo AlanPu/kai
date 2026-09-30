@@ -129,11 +129,11 @@ class ConversationSession:
         # 用户不开口，AI 就永远不会说话。安静本身没错，但用户
         # 卡住想不出句子时会一直干等，练习就停在那里了。
         #
-        # 15 秒这个值是权衡出来的：真人对话里这个长度刚好是
-        # "对方在等你开口"，再长就像冷场，再短就变成催促。
+        # 阈值和上限都由配置决定（.env 里的 IDLE_NUDGE_SEC /
+        # IDLE_NUDGE_MAX），代码不再替用户拍板。
         self._last_activity = time.time()
         self._nudges_sent = 0
-        self._max_nudges = 6          # 防止 AI 自说自话刷屏
+        self._max_nudges = getattr(self.s, "idle_nudge_max", 6)
 
         self._rotate_at = AUDIO_ITEM_ROTATE_AT
         self._rotating = False
@@ -805,7 +805,7 @@ class ConversationSession:
             return 0.0
         return time.time() - self._last_activity
 
-    def maybe_nudge(self, threshold: float = 15.0) -> Optional[str]:
+    def maybe_nudge(self, threshold: Optional[float] = None) -> Optional[str]:
         """冷场够久了就让 AI 主动找话题。
 
         返回要发给模型的提示语；不需要救场时返回 None。
@@ -815,6 +815,8 @@ class ConversationSession:
         "换个角度追问、不要把话题聊死"，否则模型容易重复上一句，
         或者说出"你还在吗？"这种扫兴的话。
         """
+        if threshold is None:
+            threshold = getattr(self.s, "idle_nudge_sec", 15.0)
         if self.ended or self.paused or not self.rt:
             return None
         if self._model_speaking or self.response_pending():
@@ -847,7 +849,7 @@ class ConversationSession:
                 "about them, and invite them to speak with ONE open question. "
                 "Keep it to one short sentence.")
 
-    async def nudge(self, threshold: float = 15.0) -> bool:
+    async def nudge(self, threshold: Optional[float] = None) -> bool:
         """冷场时让 AI 主动开口。返回是否真的开口了。
 
         由 _timer_loop 每 5 秒轮询调用。放在外部循环而不是

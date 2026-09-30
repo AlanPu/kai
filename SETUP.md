@@ -397,6 +397,9 @@ md5 models/campplus.onnx           # 应为 2ac7673f702e6e45ff45882a4dd55b1a
 | `QWEN_VOICE` | 音色 | `Tina` |
 | `TEXT_MODEL` | **材料准备 / 语法纠错 / 学习画像** | `qwen-plus` |
 | `TEXT_BASE_URL` | 文本接口地址（OpenAI 兼容） | 百炼 compatible-mode |
+| `SESSION_MINUTES` | 一次练习时长（分钟） | `30` |
+| `IDLE_NUDGE_SEC` | **冷场等待**：多久不说话 AI 主动找话题（秒，支持小数） | `15` |
+| `IDLE_NUDGE_MAX` | 连续主动开口上限（`0` = 关闭冷场救场） | `6` |
 
 ### 语音模型和文本模型是两件事
 

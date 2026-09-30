@@ -55,6 +55,8 @@ def main():
         print(f"  语音转写  {getattr(_s, 'asr_model', '?')}")
         print(f"  文本（材料准备/纠错）  {_s.text_model}")
         print(f"  文本接口  {_s.text_base_url}")
+        print(f"  冷场等待  {_s.idle_nudge_sec:g} 秒"
+              f"（最多主动开口 {_s.idle_nudge_max} 次）")
         if not _s.has_text_credentials():
             print("  ⚠️  未配置 DASHSCOPE_API_KEY，材料准备将不可用")
     except Exception as e:                       # noqa: BLE001

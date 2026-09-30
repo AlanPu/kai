@@ -49,11 +49,10 @@ logging.basicConfig(
 # server.py 在 app/api/ 下，静态页面在 app/web/
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
-# 冷场多久之后 AI 主动找话题（秒）。
+# 冷场多久之后 AI 主动找话题 —— 由 .env 的 IDLE_NUDGE_SEC 配置。
 #
-# 15 秒是权衡的结果：真人对话里这个长度刚好是"对方在等你开口"，
-# 再长就像冷场，再短就变成催促 —— 而用户需要时间组织英文句子，
-# 催太紧反而说不出来。
+# 这里保留一个模块级常量只是为了兼容旧代码/测试的引用，
+# 实际取值以 Settings 为准（见 _timer_loop）。
 IDLE_NUDGE_SEC = 15.0
 
 app = FastAPI(title="英语口语陪练")
@@ -699,7 +698,9 @@ async def _timer_loop(ws: WebSocket, sess: ConversationSession) -> None:
         # 练习就停在那儿了 —— 所以冷场够久就让 AI 主动找话题。
         # 放在这里（而不是 Qwen 回调里）是因为要发 response.create，
         # 在回调里做容易和别的事件打架。
-        await sess.nudge(IDLE_NUDGE_SEC)
+        # 传 None → 由会话自己读 Settings.idle_nudge_sec。
+        # 不再从这里的常量取，避免"改了 .env 却不生效"。
+        await sess.nudge()
 
         snap = sess.snapshot()
         await sess.on_client({

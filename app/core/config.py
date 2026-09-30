@@ -63,6 +63,17 @@ class Settings:
     # ---- 会话 ----
     session_minutes: int = 30
 
+    # 冷场多少秒后让 AI 主动找话题。
+    #
+    # 15 秒是权衡的结果：真人对话里这个长度刚好是"对方在等你开口"，
+    # 再长就像冷场，再短就变成催促 —— 用户需要时间组织英文句子，
+    # 催太紧反而说不出来。
+    #
+    # 实际感知的等待会比这个值多最多 5 秒：服务端每 5 秒轮询一次。
+    idle_nudge_sec: float = 15.0
+    # 连续主动找话题的上限，防止 AI 自说自话刷屏。
+    idle_nudge_max: int = 6
+
     # ---- 声纹 ----
     # 多人模式下每个用户一份声纹，存在 voiceprints_dir/<user_id>.json。
     # voiceprint_path 保留给老的单用户脚本（scripts/ 里还在用），
@@ -102,6 +113,21 @@ def load_settings(env: Optional[dict] = None) -> Settings:
 
     try:
         minutes = int(get("SESSION_MINUTES", "30"))
+
+        # 冷场救场：允许小数（比如 7.5 秒），所以用 float。
+        # 非数字或负数会被丢弃、退回默认值 —— 配置写错不该让服务起不来。
+        try:
+            nudge_sec = float(get("IDLE_NUDGE_SEC", "15"))
+        except ValueError:
+            nudge_sec = 15.0
+        if nudge_sec <= 0:
+            nudge_sec = 15.0
+        try:
+            nudge_max = int(get("IDLE_NUDGE_MAX", "6"))
+        except ValueError:
+            nudge_max = 6
+        if nudge_max < 0:
+            nudge_max = 6
     except ValueError:
         minutes = 30
 
@@ -123,6 +149,8 @@ def load_settings(env: Optional[dict] = None) -> Settings:
         voiceprints_dir=get_path("VOICEPRINTS_DIR",
                                  PROJECT_ROOT / "data" / "voiceprints"),
         db_path=get_path("DB_PATH", PROJECT_ROOT / "data" / "app.db"),
+        idle_nudge_sec=nudge_sec,
+        idle_nudge_max=nudge_max,
         profiles_dir=get_path("PROFILES_DIR",
                               PROJECT_ROOT / "data" / "profiles"),
     )

@@ -1268,35 +1268,6 @@ def test_frontend_enables_push_to_talk_gate():
         "应在启用 worklet 消息处理前就打开闸门"
 
 
-def test_idle_nudge_threshold_is_15_seconds():
-    """冷场阈值固定为 15 秒。
-
-    这个值调过两次意见：最初定 20 秒，用户实际用下来觉得偏长
-    （"现在 20 秒好像有点长了"），改成 15 秒。
-
-    钉住它是因为这个值同时出现在三个地方 —— server.py 的
-    IDLE_NUDGE_SEC 常量，以及 session.py 里 maybe_nudge/nudge
-    的默认参数。三处不一致会导致"改了没生效"，很难查。
-    """
-    import inspect
-
-    from app.api.server import IDLE_NUDGE_SEC
-    from app.services.session import ConversationSession
-
-    assert IDLE_NUDGE_SEC == 15.0, f"冷场阈值应为 15 秒，实际 {IDLE_NUDGE_SEC}"
-
-    for fn in (ConversationSession.maybe_nudge, ConversationSession.nudge):
-        default = inspect.signature(fn).parameters["threshold"].default
-        assert default == IDLE_NUDGE_SEC, \
-            f"{fn.__name__} 的默认值({default})与 IDLE_NUDGE_SEC({IDLE_NUDGE_SEC}) 不一致"
-
-
-# ---------- 模型全部可配置 ----------
-#
-# 用户明确要求：「你不要自己选模型，你要通过配置让我自己来设置」。
-# 所有模型名都必须来自 .env，代码里不留硬编码。
-
-
 def test_all_models_come_from_settings():
     """对话/转写/文本三个模型都必须可配置。"""
     import os
@@ -1351,3 +1322,82 @@ def test_startup_prints_active_models():
     assert "模型配置" in src, "启动横幅应打印生效的模型"
     for key in ("qwen_model", "asr_model", "text_model"):
         assert key in src, f"启动横幅应包含 {key}"
+
+
+def test_idle_threshold_comes_from_config():
+    """冷场阈值必须来自配置，不再由代码写死。
+
+    用户要求把 15 秒也做成配置项。原先它散落在三处（server.py 的
+    常量 + session.py 两个函数的默认参数），改一处不生效很难查。
+    现在统一为 Settings.idle_nudge_sec，函数默认参数是 None（读配置）。
+    """
+    import inspect
+
+    from app.core.config import load_settings
+    from app.services.session import ConversationSession
+
+    assert isinstance(load_settings().idle_nudge_sec, float)
+
+    for fn in (ConversationSession.maybe_nudge, ConversationSession.nudge):
+        default = inspect.signature(fn).parameters["threshold"].default
+        assert default is None, \
+            f"{fn.__name__} 的默认参数应为 None（表示读配置），实际 {default}"
+
+
+def test_idle_threshold_is_overridable(monkeypatch):
+    """改环境变量要真的生效。"""
+    import app.core.config as cfg
+
+    monkeypatch.setenv("IDLE_NUDGE_SEC", "7.5")
+    assert cfg.load_settings().idle_nudge_sec == 7.5
+
+    monkeypatch.setenv("IDLE_NUDGE_MAX", "3")
+    assert cfg.load_settings().idle_nudge_max == 3
+
+
+def test_bad_idle_config_falls_back(monkeypatch):
+    """配置写错不该让服务起不来，退回默认值即可。"""
+    import app.core.config as cfg
+
+    for bad in ("abc", "", "-5", "0"):
+        monkeypatch.setenv("IDLE_NUDGE_SEC", bad)
+        assert cfg.load_settings().idle_nudge_sec == 15.0, \
+            f"IDLE_NUDGE_SEC={bad!r} 应退回默认值"
+
+    monkeypatch.setenv("IDLE_NUDGE_MAX", "xyz")
+    assert cfg.load_settings().idle_nudge_max == 6
+
+
+def test_configured_threshold_actually_gates_nudging(monkeypatch):
+    """配置的秒数要真的决定什么时候开口。"""
+    import time as _t
+
+    import app.core.config as cfg
+    from app.services.session import ConversationSession
+
+    monkeypatch.setenv("IDLE_NUDGE_SEC", "8")
+    st = cfg.load_settings()
+
+    def make(idle: float):
+        x = ConversationSession.__new__(ConversationSession)
+        x.s = st
+        x.ended = False
+        x.paused = False
+        x.rt = object()
+        x._model_speaking = False
+        x._response_pending = False
+        x._nudges_sent = 0
+        x._max_nudges = st.idle_nudge_max
+        x._last_activity = _t.time() - idle
+        return x
+
+    assert make(9).maybe_nudge(), "冷场 9 秒 > 阈值 8 秒，应触发"
+    assert make(5).maybe_nudge() is None, "冷场 5 秒 < 阈值 8 秒，不该触发"
+
+
+def test_idle_settings_documented_in_env_example():
+    """.env.example 必须列出这两个配置，否则用户不知道它们存在。"""
+    src = (Path(__file__).resolve().parent.parent
+           / ".env.example").read_text(encoding="utf-8")
+    for key in ("IDLE_NUDGE_SEC", "IDLE_NUDGE_MAX"):
+        assert key in src, f"{key} 没写进 .env.example，用户无从得知"
