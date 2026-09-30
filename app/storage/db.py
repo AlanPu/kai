@@ -57,7 +57,13 @@ class Database:
         self.path = Path(path)
         if self.path.parent != Path("."):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        # check_same_thread=False：部分调用走 asyncio.to_thread（比如
+        # 抽取声纹后保存），会落在别的线程上。默认限制会直接抛
+        # "SQLite objects created in a thread can only be used in that same thread"。
+        #
+        # 这样是安全的，因为本项目所有写操作都是短事务、且都在同一个
+        # 事件循环里串行发起；没有多线程并发写同一连接的场景。
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")

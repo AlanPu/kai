@@ -438,8 +438,12 @@ async function startMic() {
 function connect(content) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const vp = $("optVp").checked ? "1" : "0";
+  // user 必须带上：服务端据此决定用谁的声纹和画像。
+  // 服务端刻意不做默认回退 —— 认错人会把你说的话记到别人名下，
+  // 而且悄无声息，所以这里也不能省。
   ws = new WebSocket(proto + "://" + location.host + "/ws/session"
-    + "?content=" + encodeURIComponent(content) + "&voiceprint=" + vp);
+    + "?user=" + (me ? me.id : "")
+    + "&content=" + encodeURIComponent(content) + "&voiceprint=" + vp);
   ws.binaryType = "arraybuffer";
   ws.onmessage = onServer;
   ws.onclose = (ev) => {
@@ -740,6 +744,13 @@ $("btnPrepare").onclick = async () => {
 $("btnStart").onclick = async () => {
   const content = ($("input").value || "").trim();
   if (!content) { toast("请先输入内容"); return; }
+  // 没有用户就不能开始：服务端要知道用谁的声纹和画像。
+  // 与其连上去被拒再弹一次选择框，不如在这里就拦住。
+  if (!me) {
+    toast("请先选择或创建一个用户");
+    openUserModal();
+    return;
+  }
   lastContent = content;
   reconnects = 0; dropped = false; elapsedBefore = 0;
   $("btnStart").disabled = true;

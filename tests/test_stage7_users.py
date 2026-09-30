@@ -656,3 +656,38 @@ def test_user_not_found_is_404_not_500(store):
                 assert e.status_code == 404, f"应为 404，实际 {e.status_code}"
     finally:
         srv.user_store = orig
+
+
+def test_db_usable_from_other_threads(tmp_path):
+    """数据库连接必须能跨线程使用。
+
+    录入流程里"抽完声纹再保存"走的是 asyncio.to_thread，
+    会落在另一个线程上。sqlite3 默认禁止这么做，会抛
+    "SQLite objects created in a thread can only be used in that same thread"，
+    表现为录入走完最后一步连接直接断掉 —— 用户看到的是
+    "读完了却没保存上"，很难联想到线程问题。
+    """
+    import threading
+    from app.storage.db import Database
+
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    uid = db.create_user("线程用户")
+
+    err = []
+
+    def work():
+        try:
+            assert db.get_user(uid).name == "线程用户"
+            db.upsert_fact(ProfileFact(user_id=uid, category="background",
+                                       key="职业", value="工程师",
+                                       confidence=0.9))
+            assert len(db.list_facts(user_id=uid)) == 1
+        except Exception as e:      # noqa: BLE001
+            err.append(e)
+
+    t = threading.Thread(target=work)
+    t.start()
+    t.join()
+    assert not err, f"跨线程访问数据库失败: {err[0]}"
+    db.close()
