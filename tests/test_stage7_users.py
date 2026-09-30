@@ -1518,3 +1518,56 @@ def test_no_chinese_identifiers_in_frontend():
     # 找 const/let/var 后面跟中文标识符
     bad = _re.findall(r"\b(?:const|let|var)\s+([\u4e00-\u9fff]\w*)", code)
     assert not bad, f"前端出现中文变量名：{bad}"
+
+
+def test_start_script_exists_and_handles_restart():
+    """启动脚本要先停旧进程再启动。
+
+    直接重复启动会因端口被占而失败，但旧进程还在响应 ——
+    表现为"改了代码却没生效"，这是最费解的一类问题。
+    """
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    sh = root / "start.sh"
+    assert sh.is_file(), "缺少 start.sh"
+    assert sh.stat().st_mode & 0o111, "start.sh 应可执行"
+
+    src = sh.read_text(encoding="utf-8")
+    # 去掉注释再断言，避免注释里的说明文字蒙混过关
+    code = "\n".join(ln for ln in src.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    # 必须真的**调用** stop_server，而不只是定义了它 ——
+    # 只检查字符串的话，函数定义本身就能让断言通过，测不出漏调用。
+    #
+    # 还要注意：--stop 分支里也有一次调用。所以只看"有没有调用"
+    # 仍然不够 —— 得确认**启动路径**上也调用了一次。
+    # （这一点是实测发现的：删掉启动路径上的调用，测试照样通过。）
+    # 把整个 case...esac 块删掉（里面 --stop 分支也有一次调用，
+    # 不排除掉的话，删了启动路径上的调用测试照样通过 —— 实测踩过）
+    body = re.sub(r"^case .*?^esac", "", code, flags=re.M | re.S)
+    assert "case " not in body, "case 块没被剥掉"
+    assert re.search(r"^\s*stop_server\s*$", body, re.M), \
+        "启动路径上应先调用 stop_server 停止旧进程"
+    assert "run.py" in code, "应调用 run.py"
+    # 必须等端口释放，否则会撞 Address already in use
+    assert "pids_on_port" in code
+    # 必须做健康检查，否则配置错了要等打开网页才发现
+    assert "api/health" in code
+
+
+def test_start_script_flags():
+    """脚本要支持文档里写的那些参数。"""
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "start.sh").read_text(encoding="utf-8")
+    for flag in ("--stop", "--status", "--logs", "--help",
+                 "--ssl", "--port", "--reload"):
+        assert flag in src, f"脚本应支持 {flag}"
+
+
+def test_docs_point_to_start_script():
+    """文档里的启动方式要和实际一致，不能还写着老命令。"""
+    root = Path(__file__).resolve().parent.parent
+    for name in ("SETUP.md", "docs/使用说明.md"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "./start.sh" in text, f"{name} 应提到 ./start.sh"

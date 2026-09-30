@@ -2,21 +2,52 @@
 
 ## 怎么启动
 
-**只有一个入口**：
+**推荐用启动脚本**（会先停掉旧进程，再确认真的起来了）：
 
 ```bash
 cd kai
-.venv/bin/python -m app                # 本机用，浏览器打开 http://127.0.0.1:8000
-.venv/bin/python -m app --ssl          # 手机用，需要 HTTPS
-.venv/bin/python -m app --port 8001    # 换端口
+./start.sh                 # 本机用，浏览器打开 http://127.0.0.1:8000
+./start.sh --ssl           # 手机/平板用（自动显示手机访问地址）
+./start.sh --port 8001     # 换端口
+./start.sh --reload        # 改代码自动重启（开发用）
 ```
 
-想省事就用 `.venv/bin/python run.py`（等价，会打印访问地址）。
+脚本还带几个常用命令：
+
+```bash
+./start.sh --status        # 看是否在运行、健康检查是否正常
+./start.sh --stop          # 停止
+./start.sh --logs          # 实时看日志（出错先看这个）
+./start.sh --help          # 全部用法
+```
+
+**它比手敲命令多做三件事**（都是踩过的坑）：
+
+1. **先停旧进程**——不停的话，新进程因端口被占而启动失败，但旧进程
+   还在响应，于是表现为「改了代码却没生效」，非常难查。
+2. **等端口真正释放**——`pkill` 之后进程不是立刻消失的，马上启动会撞
+   `Address already in use`。
+3. **启动后做一次健康检查**——配置错时进程会活着但没法用，脚本会直接
+   告诉你失败并打印日志，而不是让你打开网页才发现。
+
+日志写在 `data/logs/server.log`。启动成功时会打印**实际生效的模型和参数**，
+一眼就能核对配置对不对。
+
+### 不想用脚本
+
+```bash
+.venv/bin/python run.py                # 等价，会打印访问地址
+.venv/bin/python run.py --ssl          # 手机用，需要 HTTPS
+.venv/bin/python run.py --port 8001    # 换端口
+```
+
+`./start.sh` 就是 `pkill -f run.py` + `.venv/bin/python run.py`
+再加上上面的检查和提示，参数完全一样。
 
 > ⚠️ **不要运行 `python server.py`** —— 那个文件已经删掉了。
 > 它是原型期的入口，正式版拆成了 `app/` 包。
-> 如果你看到 `can't open file '.../server.py'`，就是这个原因，
-> 换成上面的 `-m app` 即可。原型仍完整保留在 `prototype/` 里。
+> 如果你看到 `can't open file '.../server.py'`，就是这个原因。
+> 原型仍完整保留在 `prototype/` 里。
 
 
 ## 怎么说话：按住空格
@@ -61,7 +92,7 @@ cp .env.example .env                # 编辑 .env，填 DASHSCOPE_API_KEY 和 QW
 mkdir -p models && curl -L -o models/campplus.onnx \
   https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
 .venv/bin/python scripts/check_qwen.py   # 自检：确认密钥/区域/模型都能用（几乎零成本）
-.venv/bin/python -m app             # 启动，浏览器打开 http://127.0.0.1:8000
+./start.sh                          # 启动，浏览器打开 http://127.0.0.1:8000
 ```
 
 > **出问题先跑自检**。它只连一次、不发音频，能把"配置错"和"代码错"分开。
@@ -492,7 +523,7 @@ F12 就能拿走。所以必须有后端持有密钥：
 
 ```bash
 # 电脑上（浏览器只在 localhost 下允许麦克风）
-.venv/bin/python -m app
+./start.sh
 # 打开 http://127.0.0.1:8000
 ```
 
@@ -500,8 +531,8 @@ F12 就能拿走。所以必须有后端持有密钥：
 
 ```bash
 .venv/bin/python scripts/make_cert.py           # 生成自签证书（只需一次）
-.venv/bin/python -m app --host 0.0.0.0 --ssl
-# 手机访问 https://<你的局域网IP>:8000
+./start.sh --ssl --host 0.0.0.0
+# 脚本会自动打印手机能打开的地址（形如 https://192.168.x.x:8000）
 # 首次会提示证书不受信任 → 高级 → 继续前往
 ```
 
