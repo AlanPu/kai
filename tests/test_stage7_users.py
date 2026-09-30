@@ -1571,3 +1571,68 @@ def test_docs_point_to_start_script():
     for name in ("SETUP.md", "docs/使用说明.md"):
         text = (root / name).read_text(encoding="utf-8")
         assert "./start.sh" in text, f"{name} 应提到 ./start.sh"
+
+
+def test_root_has_no_stray_docs():
+    """根目录只留 README 和 SETUP，其余文档都应归到 docs/。
+
+    根目录堆一堆 md 会让新来的人不知道从哪看起。
+    README 是入口，SETUP 是搭建指南 —— 这两个留在根目录符合惯例。
+    """
+    root = Path(__file__).resolve().parent.parent
+    stray = sorted(p.name for p in root.glob("*.md"))
+    assert stray == ["README.md", "SETUP.md"], \
+        f"根目录出现了不该有的文档：{stray}"
+
+
+def test_readme_links_resolve():
+    """README 里的相对链接必须真的能打开。"""
+    import re as _re
+
+    root = Path(__file__).resolve().parent.parent
+    md = root / "README.md"
+    assert md.is_file(), "缺少 README.md"
+    text = md.read_text(encoding="utf-8")
+    for m in _re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text):
+        target = m.group(2)
+        if target.startswith(("http://", "https://", "#")):
+            continue
+        p = (md.parent / target.split("#")[0]).resolve()
+        assert p.exists(), f"README 链接失效：[{m.group(1)}]({target})"
+
+
+def test_readme_mentions_key_facts():
+    """README 该说的关键信息不能漏，否则新人跑不起来。"""
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "README.md").read_text(encoding="utf-8")
+    for token in ("./start.sh", ".env", "SETUP.md", "按住空格",
+                  "声纹", "docs/"):
+        assert token in text, f"README 缺少关键信息：{token}"
+
+
+def test_docs_test_count_matches_reality():
+    """文档里写的测试数量应和实际一致。
+
+    这个数字散落在多处，每次加测试都要手动同步，很容易忘。
+    让测试自己盯着。
+    """
+    import re as _re
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    # 注意输出格式是 "278/284 tests collected (6 deselected)"，
+    # 第一个数字才是实际会被跑的个数。
+    out = subprocess.run(
+        [".venv/bin/python", "-m", "pytest", "-m", "not live",
+         "--collect-only"],
+        cwd=root, capture_output=True, text=True).stdout
+    m = _re.search(r"(\d+)/(\d+)\s+tests?\s+collected", out)
+    if not m:
+        pytest.skip(f"拿不到测试数量，输出：{out[-200:]}")
+    actual = int(m.group(1))
+
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    claimed = [int(x) for x in _re.findall(r"(\d{3}) 个测试", readme)]
+    assert claimed, "README 应写明测试数量"
+    for c in claimed:
+        assert c == actual, f"README 写 {c} 个测试，实际 {actual} 个"

@@ -230,7 +230,7 @@ mkdir -p models && curl -L -o models/campplus.onnx \
 > 实际原因是 `SpeakerVerifier` 的静音门槛按 int16 量级（±32768）编写，
 > 而诊断脚本喂的是 float32（±1.0）音频 → RMS 恒小于门槛 → 永远出不了分。
 > 已在 `core.py` 中按 dtype 归一化修复，float32 / int16 两种输入都支持。
-> 详见 `问题诊断-声纹采集不到声音.md`。
+> 详见 [`docs/问题诊断-声纹采集不到声音.md`](docs/问题诊断-声纹采集不到声音.md)。
 
 ### 浏览器 DSP（AEC / 降噪 / 自动增益）该不该关？
 
@@ -624,7 +624,7 @@ to the Azure OpenAI Service.
 
 **替代路径**：改用 **Qwen Realtime**（国内直连、即开即用、个人可注册）做对话层；**发音评测**改用 Azure Speech 的 Pronunciation Assessment（属于 Cognitive Services 的 Speech，**不走 Azure OpenAI 的准入限制**，个人可用）。
 
-详见 `英语口语陪练-推荐方案.md` 的修订版。
+详见 [`docs/英语口语陪练-推荐方案.md`](docs/英语口语陪练-推荐方案.md) 的修订版。
 
 ---
 

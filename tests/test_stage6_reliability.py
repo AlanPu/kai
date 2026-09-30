@@ -930,3 +930,59 @@ def test_docs_match_reality():
     for flag in ("--ssl", "--host"):
         if flag in doc:
             assert flag in code, f"文档提到 {flag}，但代码没实现"
+
+
+# ---------- 分层规则 ----------
+#
+# core 是最底层（配置、协议、音频），services 建立在它之上，
+# api 再建立在 services 之上。反过来 import 会形成环，
+# 也会让底层被迫知道上层的事。
+#
+# 之前 README 里写了"分层由测试强制"，但其实没有任何测试在管这件事 ——
+# 规则只是靠自觉。这里补上真正的检查。
+
+
+def test_layering_is_enforced():
+    """core 不得 import services/api；services 不得 import api。"""
+    import ast
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parent.parent
+    violations = []
+
+    def imports_of(pkg: str):
+        """收集某个包里所有模块 import 的顶层包名。"""
+        found = set()
+        for f in (root / pkg).rglob("*.py"):
+            try:
+                tree = ast.parse(f.read_text(encoding="utf-8"))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        found.add((a.name, f))
+                elif isinstance(node, ast.ImportFrom):
+                    # 相对 import：node.level>0 时拼成绝对包名
+                    if node.level and node.module is not None:
+                        base = pkg
+                        for _ in range(node.level - 1):
+                            base = str(_P(base).parent)
+                        full = f"{base}.{node.module}".strip(".")
+                    else:
+                        full = node.module or ""
+                    found.add((full, f))
+        return found
+
+    forbidden = {
+        "app/core": ("app.services", "app.api"),
+        "app/services": ("app.api",),
+    }
+    for pkg, bad_prefixes in forbidden.items():
+        for name, f in imports_of(pkg):
+            for bad in bad_prefixes:
+                if name == bad or name.startswith(bad + "."):
+                    violations.append(
+                        f"{f.relative_to(root)} 导入了 {name}")
+
+    assert not violations, "破坏分层：\n  " + "\n  ".join(violations)
