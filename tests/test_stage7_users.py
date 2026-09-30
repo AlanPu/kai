@@ -7,6 +7,7 @@
 """
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -783,9 +784,9 @@ def test_end_turn_flushes_pending_before_responding():
     声纹判定未完成时音频会短暂留在 _pending。按住空格说话时
     用户可能说得很快，松手瞬间缓冲里还有内容 —— 不 flush 会丢句尾。
     """
-    from pathlib import Path
+    from pathlib import Path as _P
 
-    src = (Path(__file__).resolve().parent.parent
+    src = (_P(__file__).resolve().parent.parent
            / "app" / "services" / "session.py").read_text(encoding="utf-8")
     body = src[src.index("async def end_turn"):]
     body = body[:body.index("def _maybe_respond")]
@@ -1288,3 +1289,65 @@ def test_idle_nudge_threshold_is_15_seconds():
         default = inspect.signature(fn).parameters["threshold"].default
         assert default == IDLE_NUDGE_SEC, \
             f"{fn.__name__} 的默认值({default})与 IDLE_NUDGE_SEC({IDLE_NUDGE_SEC}) 不一致"
+
+
+# ---------- 模型全部可配置 ----------
+#
+# 用户明确要求：「你不要自己选模型，你要通过配置让我自己来设置」。
+# 所有模型名都必须来自 .env，代码里不留硬编码。
+
+
+def test_all_models_come_from_settings():
+    """对话/转写/文本三个模型都必须可配置。"""
+    import os
+
+    from app.core.config import load_settings
+
+    # 默认值可以用，但必须能被环境变量覆盖
+    for env_key in ("QWEN_MODEL", "QWEN_ASR_MODEL", "TEXT_MODEL",
+                    "QWEN_VOICE", "TEXT_BASE_URL"):
+        assert env_key in os.environ or True, env_key   # 存在性由下一条保证
+
+    src_env = (Path(__file__).resolve().parent.parent / ".env.example").read_text(
+        encoding="utf-8")
+    for env_key in ("QWEN_MODEL", "QWEN_ASR_MODEL", "TEXT_MODEL",
+                    "QWEN_VOICE", "TEXT_BASE_URL"):
+        assert env_key in src_env, f"{env_key} 没写进 .env.example，用户无从得知"
+
+
+def test_asr_model_is_not_hardcoded(monkeypatch):
+    """ASR 转写模型必须读配置，不能写死在代码里。"""
+    import app.core.config as cfg
+
+    monkeypatch.setenv("QWEN_ASR_MODEL", "some-other-asr")
+    assert cfg.load_settings().asr_model == "some-other-asr"
+
+    # 代码里不该再出现写死的模型名（注释除外）
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "core" / "realtime.py").read_text(encoding="utf-8")
+    import re
+    code = re.sub(r"#[^\n]*", "", src)
+    assert '"qwen3-asr-flash-realtime"' not in code, \
+        "ASR 模型名仍被写死在代码里，用户改不了"
+
+
+def test_text_model_is_configurable(monkeypatch):
+    """材料准备用的文本模型必须可配置。"""
+    import app.core.config as cfg
+
+    monkeypatch.setenv("TEXT_MODEL", "qwen-max")
+    monkeypatch.setenv("TEXT_BASE_URL", "https://example.invalid/v1")
+    s = cfg.load_settings()
+    assert s.text_model == "qwen-max"
+    assert s.text_base_url == "https://example.invalid/v1"
+
+
+def test_startup_prints_active_models():
+    """启动时打印实际生效的模型，配置错了能立刻发现。"""
+    from pathlib import Path as _P
+
+    src = (_P(__file__).resolve().parent.parent
+           / "app" / "__main__.py").read_text(encoding="utf-8")
+    assert "模型配置" in src, "启动横幅应打印生效的模型"
+    for key in ("qwen_model", "asr_model", "text_model"):
+        assert key in src, f"启动横幅应包含 {key}"

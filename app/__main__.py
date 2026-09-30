@@ -42,6 +42,24 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
+    # 启动时把实际生效的模型打出来。
+    #
+    # 理由：模型全部由 .env 配置，但配置错了不会立刻报错 ——
+    # 往往是练到一半才发现"材料准备失败"或"没有字幕"，
+    # 那时才去翻配置很费劲。开机打印一行，一眼就能核对。
+    try:
+        from app.core.config import load_settings
+        _s = load_settings()
+        print("模型配置：")
+        print(f"  语音对话  {_s.qwen_model}")
+        print(f"  语音转写  {getattr(_s, 'asr_model', '?')}")
+        print(f"  文本（材料准备/纠错）  {_s.text_model}")
+        print(f"  文本接口  {_s.text_base_url}")
+        if not _s.has_text_credentials():
+            print("  ⚠️  未配置 DASHSCOPE_API_KEY，材料准备将不可用")
+    except Exception as e:                       # noqa: BLE001
+        print(f"（读取配置失败：{e}）", file=sys.stderr)
+
     uvicorn.run(
         "app.api.server:app",
         host=a.host,

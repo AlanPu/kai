@@ -372,7 +372,52 @@ md5 models/campplus.onnx           # 应为 2ac7673f702e6e45ff45882a4dd55b1a
 | **输入音频** | **16 kHz** PCM 单声道 16-bit |
 | **输出音频** | **24 kHz** PCM 单声道 16-bit ← **与输入不同！** |
 | `modalities` | 必须是 `["text","audio"]`，**传 `["audio"]` 会报错** |
-| 转写模型 | 固定 `qwen3-asr-flash-realtime`，不可改 |
+| 转写模型 | 由 `QWEN_ASR_MODEL` 配置（默认 `qwen3-asr-flash-realtime`） |
+
+---
+
+## 换模型（全部通过配置，不需要改代码）
+
+启动时会打印实际生效的模型：
+
+```
+模型配置：
+  语音对话  qwen3.8-omni-flash-realtime
+  语音转写  qwen3-asr-flash-realtime
+  文本（材料准备/纠错）  qwen-plus
+  文本接口  https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+改 `.env` 里对应的值、重启即可生效。
+
+| 配置项 | 作用 | 默认 |
+|---|---|---|
+| `QWEN_MODEL` | **语音对话**：听懂并回话 | `qwen3.8-omni-flash-realtime` |
+| `QWEN_ASR_MODEL` | **语音转写**：把你说的话变成文字 | `qwen3-asr-flash-realtime` |
+| `QWEN_VOICE` | 音色 | `Tina` |
+| `TEXT_MODEL` | **材料准备 / 语法纠错 / 学习画像** | `qwen-plus` |
+| `TEXT_BASE_URL` | 文本接口地址（OpenAI 兼容） | 百炼 compatible-mode |
+
+### 语音模型和文本模型是两件事
+
+这两个**互相独立**，但共用同一个 `DASHSCOPE_API_KEY` 和同一份额度，
+不需要分别申请：
+
+- **语音模型**决定能不能对话
+- **文本模型**决定能不能准备材料、能不能纠错、能不能总结画像
+
+也就是说，如果哪天文本模型不可用，你仍然可以和 AI 说话，
+但"材料准备"会失败 —— 反过来也一样。
+
+材料准备之所以单独用一个文本模型：它是**批处理式的一次性规划**
+（分析主题、列出想问的问题），用便宜快的文本模型就够了；
+让实时语音模型来做反而更贵，因为它按音频时长计费、上下文也更长。
+
+### 想换成别的厂商
+
+`TEXT_BASE_URL` + `TEXT_MODEL` + `DASHSCOPE_API_KEY` 三个一起改，
+填任何 **OpenAI 兼容**的服务都能用（DeepSeek、Moonshot、本地 vLLM 等）。
+语音那部分则依赖 Qwen Realtime 的 WebSocket 协议，换厂商需要改代码。
 
 ---
 

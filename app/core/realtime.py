@@ -4,7 +4,7 @@ Qwen Realtime 会话封装。
 协议要点（实测确定，改动会直接导致失败）：
   · 上行 16 kHz / 下行 24 kHz —— 上下行采样率**不同**
   · modalities 必须同时含 "text" 和 "audio"，只给 "audio" 会 invalid_value
-  · 转写模型固定为 qwen3-asr-flash-realtime
+  · 转写模型由 QWEN_ASR_MODEL 配置（默认 qwen3-asr-flash-realtime）
   · WebSocket 协议**无 AEC/降噪**，需客户端自行处理
 
 本模块只负责协议，不含业务逻辑（声纹过滤、纠错在别处）。
@@ -204,7 +204,9 @@ class RealtimeSession:
             "instructions": self.instructions,
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm24",
-            "input_audio_transcription": {"model": "qwen3-asr-flash-realtime"},
+            # 转写模型来自配置（Settings.asr_model 本身有默认值），
+            # 这里不再写死 —— 写死会导致 .env 改了却不生效。
+            "input_audio_transcription": {"model": self.s.asr_model},
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": self.vad_threshold,

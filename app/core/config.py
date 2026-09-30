@@ -50,6 +50,10 @@ class Settings:
     qwen_region: str = "cn-beijing"
     qwen_model: str = "qwen3.8-omni-flash-realtime"
     qwen_voice: str = "Tina"
+    # 语音转写模型：把用户说的话转成文字（用于显示、纠错、入库）。
+    # 和 qwen_model 是两件事：qwen_model 负责"听懂并回话"，
+    # asr_model 只负责"把语音变成文本"。
+    asr_model: str = "qwen3-asr-flash-realtime"
 
     # ---- 文本：话题分析 / 纠错 / 画像 ----
     text_model: str = "qwen-plus"
@@ -107,6 +111,7 @@ def load_settings(env: Optional[dict] = None) -> Settings:
         qwen_region=get("QWEN_REGION", "cn-beijing"),
         qwen_model=get("QWEN_MODEL", "qwen3.8-omni-flash-realtime"),
         qwen_voice=get("QWEN_VOICE", "Tina"),
+        asr_model=get("QWEN_ASR_MODEL", "qwen3-asr-flash-realtime"),
         text_model=get("TEXT_MODEL", "qwen-plus"),
         text_base_url=get("TEXT_BASE_URL",
                           "https://dashscope.aliyuncs.com/compatible-mode/v1"),
