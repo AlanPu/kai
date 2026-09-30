@@ -902,3 +902,86 @@ def test_invalid_request_error_is_not_fatal():
                  "insufficient_quota", "session_expired"):
         assert is_fatal_error(code), f"{code} 应当仍是致命错误"
 
+
+
+# ---------- AI 语音播放（前端）----------
+#
+# 用户反馈「我听不到 AI 的语音」。根因在前端播放路径：
+#   1) 收到 user_speaking（VAD 对噪声/AI尾音也会触发）就调 stopPlayback()
+#   2) 而 stopPlayback 用 ctxOut.close() 停声，紧接着新建的 AudioContext
+#      常处于 suspended → 之后所有 AI 音频都无声
+# 下面几个测试把正确的播放路径锁住。
+
+
+def _web_html() -> str:
+    from pathlib import Path
+    return (Path(__file__).resolve().parent.parent
+            / "app" / "web" / "index.html").read_text(encoding="utf-8")
+
+
+def _web_code() -> str:
+    """Returns JS source with comments stripped.
+
+    Use this whenever asserting that something is NOT called: an
+    explanatory comment that merely mentions the name would otherwise
+    make the test fail (already tripped over this once in this file).
+    """
+    import re
+    src = _web_html()
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    src = re.sub(r"//[^\n]*", "", src)
+    return src
+
+
+def test_stop_playback_does_not_destroy_audio_context():
+    """停声不能销毁 AudioContext —— 否则后续语音再也播不出来。
+
+    实测症状：用户完全听不到 AI 说话。原因是用 ctxOut.close() 停声，
+    而 close() 是异步的，紧接着 new AudioContext() 在浏览器里常是
+    suspended 状态，音频就静默了。
+    """
+    src = _web_html()
+    body = src[src.index("function stopPlayback()"):]
+    body = body[:body.index("function ensureOutCtx")]
+    assert "close()" not in body, \
+        "stopPlayback 不能 close() 音频上下文（会导致 AI 语音无声）"
+    assert "playingSources" in body, "stopPlayback 应逐个停掉播放源"
+
+
+def test_user_speaking_does_not_cut_ai_audio():
+    """user_speaking 不能掐断 AI 的语音。
+
+    服务端 VAD 对噪声、甚至 AI 自己的尾音都会报 user_speaking。
+    原来一收到就 stopPlayback()，AI 刚开口就被打断，
+    用户根本听不全。抢话打断只应由「按下空格」触发。
+    """
+    src = _web_code()
+    seg = src[src.index('m.type === "user_speaking"'):]
+    seg = seg[:seg.index('m.type === "user_text"')]
+    assert "stopPlayback" not in seg, \
+        "user_speaking 不应调 stopPlayback（VAD 误报会切掉 AI 的声音）"
+
+
+def test_push_to_talk_interrupts_ai_on_space_press():
+    """按下空格要立刻停下 AI 的播放（真实抢话）。"""
+    src = _web_html()
+    body = src[src.index("function pttDown()"):]
+    body = body[:body.index("function pttUp")]
+    assert "stopPlayback()" in body, "按下空格应停掉 AI 播放"
+
+
+def test_audio_output_context_is_recovered():
+    """播放前要确保音频上下文可用（被挂起时自动 resume）。
+
+    浏览器要求 AudioContext 由用户手势创建/恢复，否则一直 suspended。
+    """
+    src = _web_html()
+    assert "function ensureOutCtx" in src, "缺少 ensureOutCtx"
+    body = src[src.index("function ensureOutCtx"):]
+    body = body[:body.index("async function startMic")]
+    assert "resume()" in body, "ensureOutCtx 必须处理 suspended 状态"
+
+    # enqueueAudio 必须走 ensureOutCtx，不能自己判断 ctxOut 是否存在
+    enq = src[src.index("function enqueueAudio"):]
+    enq = enq[:enq.index("function stopPlayback")]
+    assert "ensureOutCtx()" in enq, "enqueueAudio 应通过 ensureOutCtx 取上下文"

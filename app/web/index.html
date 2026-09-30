@@ -318,6 +318,8 @@ const $ = id => document.getElementById(id);
 
 let ws = null, micStream = null, worklet = null, srcNode = null;
 let ctxIn = null, ctxOut = null, playHead = 0;
+// 正在播放的 AI 语音源。抢话时只停这些，不再销毁 AudioContext。
+let playingSources = [];
 let running = false, prepared = null, reportShown = false;
 let lastContent = "", dropped = false, elapsedBefore = 0, reconnects = 0;
 let aborted = false, paused = false;
@@ -389,7 +391,8 @@ function addCorrection(c) {
 }
 
 function enqueueAudio(bytes) {
-  if (!ctxOut) return;
+  if (!bytes || !bytes.byteLength) return;
+  const ctxOut = ensureOutCtx();       // 缺了/被挂起时自动恢复
   const i16 = new Int16Array(bytes.buffer, bytes.byteOffset,
                              bytes.byteLength >> 1);
   const f32 = new Float32Array(i16.length);
@@ -402,14 +405,42 @@ function enqueueAudio(bytes) {
   src.connect(ctxOut.destination);
   src.start(playHead);
   playHead += buf.duration;
+  // 记下正在播的源，抢话时要逐个停掉
+  playingSources.push(src);
+  src.onended = () => {
+    const i = playingSources.indexOf(src);
+    if (i >= 0) playingSources.splice(i, 1);
+  };
 }
 
+// 立刻停掉正在播放的 AI 语音（抢话时用）。
+//
+// ⚠️ 这里**不能**用 ctxOut.close() 来"停声"：
+// close() 是异步的，而紧接着新建的 AudioContext 在部分浏览器里
+// 会处于 suspended 状态 —— 结果是 AI 的语音再也播不出来
+// （用户反馈："我听不到 AI 的语音"）。
+//
+// 正确做法是只停掉当前的播放源，保持 ctxOut 一直可用。
 function stopPlayback() {
+  for (const s of playingSources) {
+    try { s.stop(); } catch (e) {}
+    try { s.disconnect(); } catch (e) {}
+  }
+  playingSources = [];
   playHead = 0;
-  if (ctxOut) {
-    try { ctxOut.close(); } catch (e) {}
+}
+
+// 确保有可用的输出 AudioContext。
+// 浏览器要求音频上下文必须由用户手势创建/恢复，
+// 否则会是 suspended，声音出不来。
+function ensureOutCtx() {
+  if (!ctxOut || ctxOut.state === "closed") {
     ctxOut = new AudioContext({ sampleRate: OUT_RATE });
   }
+  if (ctxOut.state === "suspended") {
+    ctxOut.resume().catch(() => {});
+  }
+  return ctxOut;
 }
 
 async function startMic() {
@@ -581,8 +612,16 @@ function onServer(ev) {
     $("pttBar").classList.add("show");
     $("duringHint").textContent = "按住空格开始说";
   } else if (m.type === "user_speaking") {
+    // 服务端 VAD 报告"检测到人声"。
+    //
+    // ⚠️ 这里**不再**调 stopPlayback()。
+    // 原来一收到这个事件就掐掉 AI 的声音，但 VAD 对噪声、
+    // 甚至 AI 自己的尾音都可能触发 —— 结果 AI 刚开口就被打断，
+    // 用户根本听不全（反馈："我听不到 AI 的语音"）。
+    //
+    // 抢话打断现在只由「按下空格」这个明确动作触发（见 pttDown），
+    // 那是用户真实意图，不会误判。
     $("dAi").classList.remove("live");
-    stopPlayback();
   } else if (m.type === "user_text") {
     addMsg("user", m.text);
   } else if (m.type === "ai_text") {
@@ -683,6 +722,7 @@ function cleanup() {
   if (worklet) { try { worklet.disconnect(); } catch (e) {} worklet = null; }
   if (ctxIn) { try { ctxIn.close(); } catch (e) {} ctxIn = null; }
   if (ctxOut) { try { ctxOut.close(); } catch (e) {} ctxOut = null; }
+  playingSources = [];         // 上下文已关，旧引用失效
   $("dMic").classList.remove("live");
   $("dAi").classList.remove("live");
   dropped = keep;
@@ -755,7 +795,7 @@ async function resume() {
   }
   $("duringHint").textContent = "重新连接中…";
   try {
-    if (!ctxOut) ctxOut = new AudioContext({ sampleRate: OUT_RATE });
+    ensureOutCtx();
     if (!micStream) await startMic();
     $("dMic").classList.add("live");
     dropped = false;
@@ -862,7 +902,7 @@ $("btnStart").onclick = async () => {
   $("during").classList.remove("hidden");
   $("duringHint").textContent = "正在连接…";
   try {
-    ctxOut = new AudioContext({ sampleRate: OUT_RATE });
+    ensureOutCtx();
     await startMic();
     $("dMic").classList.add("live");
     connect(content);
