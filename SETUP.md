@@ -394,7 +394,7 @@ md5 models/campplus.onnx           # 应为 2ac7673f702e6e45ff45882a4dd55b1a
 |---|---|---|
 | `QWEN_MODEL` | **语音对话**：听懂并回话 | `qwen3.8-omni-flash-realtime` |
 | `QWEN_ASR_MODEL` | **语音转写**：把你说的话变成文字 | `qwen3-asr-flash-realtime` |
-| `QWEN_VOICE` | 音色 | `Tina` |
+| `QWEN_VOICE` | 音色（见下文，17 个可选） | `Tina` |
 | `TEXT_MODEL` | **材料准备 / 语法纠错 / 学习画像** | `qwen-plus` |
 | `TEXT_BASE_URL` | 文本接口地址（OpenAI 兼容） | 百炼 compatible-mode |
 | `SESSION_MINUTES` | 一次练习时长（分钟） | `30` |
@@ -421,6 +421,32 @@ md5 models/campplus.onnx           # 应为 2ac7673f702e6e45ff45882a4dd55b1a
 `TEXT_BASE_URL` + `TEXT_MODEL` + `DASHSCOPE_API_KEY` 三个一起改，
 填任何 **OpenAI 兼容**的服务都能用（DeepSeek、Moonshot、本地 vLLM 等）。
 语音那部分则依赖 Qwen Realtime 的 WebSocket 协议，换厂商需要改代码。
+
+
+### 音色怎么选
+
+```bash
+.venv/bin/python scripts/list_voices.py            # 看全部可选音色
+.venv/bin/python scripts/list_voices.py --sample   # 生成样音试听
+```
+
+**注意有两套音色清单，这是实测踩的坑：**
+
+- **对话音色**（17 个）—— `QWEN_VOICE` 能填的值，AI 说话用的
+- **TTS 音色**（43 个）—— 只有这些能合成试听样音
+
+两套**只有部分重叠**。`Tina` 只在对话那套里，用 TTS 合成
+试听会报 `Invalid voice specified` —— 不是名字写错，是那个模型
+根本不带这个音色。工具已经把两套分开列了。
+
+对话音色全清单（`scripts/list_voices.py` 会打印同样的内容）：
+
+`Tina`（默认）、`Cindy`、`Liora Mira`、`Raymond`、`Zane`、
+`Katerina`、`Ryan`、`Mia`、`Cici`、`Theo Calm`、`Serena`、
+`Maia`、`Evan`、`Qiao`、`Momo`、`Wil`、`Angel`
+
+来源：百炼「[非实时（Qwen-Omni）和实时（Qwen-Omni-Realtime）支持的音色列表](https://help.aliyun.com/zh/model-studio/omni-voice-list)」。
+不同模型支持的音色可能不同 —— 换模型后值得再跑一次 `list_voices.py`。
 
 ---
 

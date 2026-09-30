@@ -1401,3 +1401,46 @@ def test_idle_settings_documented_in_env_example():
            / ".env.example").read_text(encoding="utf-8")
     for key in ("IDLE_NUDGE_SEC", "IDLE_NUDGE_MAX"):
         assert key in src, f"{key} 没写进 .env.example，用户无从得知"
+
+
+def test_voice_is_configurable(monkeypatch):
+    """音色必须由配置决定（用户要能自己换）。"""
+    import app.core.config as cfg
+
+    monkeypatch.setenv("QWEN_VOICE", "Serena")
+    assert cfg.load_settings().qwen_voice == "Serena"
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "core" / "config.py").read_text(encoding="utf-8")
+    assert 'get("QWEN_VOICE"' in src, "音色应读 QWEN_VOICE"
+
+
+def test_voice_list_tool_distinguishes_two_sets():
+    """对话音色和 TTS 音色是两套清单，工具必须区分。
+
+    实测教训：用 TTS 模型合成 "Tina" 会报 Invalid voice specified ——
+    因为 Tina 只在实时对话模型里存在，TTS 那套没有。如果工具把两套
+    混在一起，用户试听时就会撞上一堆莫名其妙的失败。
+    """
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "list_voices", root / "scripts" / "list_voices.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    chat = {v for v, _ in mod.CHAT_VOICES}
+    tts = {v for v, _ in mod.TTS_VOICES}
+
+    assert "Tina" in chat, "Tina 是对话音色"
+    assert "Tina" not in tts, "Tina 不在 TTS 清单里，试听会失败"
+    assert "Aiden" in tts
+    assert chat & tts, "两套应有重叠（如 Serena/Ethan）"
+
+
+def test_voice_samples_dir_is_gitignored():
+    """样音是本地试听用的，不该进仓库。"""
+    root = Path(__file__).resolve().parent.parent
+    gi = (root / ".gitignore").read_text(encoding="utf-8")
+    assert "data" in gi, "data/ 应被忽略"
