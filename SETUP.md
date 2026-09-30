@@ -425,6 +425,18 @@ md5 models/campplus.onnx           # 应为 2ac7673f702e6e45ff45882a4dd55b1a
 
 ### 音色怎么选
 
+**方式一：网页上直接选（推荐）**
+
+点右上角 **「音色」** 按钮 → 列表里点 ▶ 试听 → 点一行选中，立即生效。
+面板里也放了[官方音色列表](https://help.aliyun.com/zh/model-studio/omni-voice-list)
+的链接，可以随时打开自己对比。
+
+选择会记住（存在 `data/voice_override.txt`），重启后仍是你选的那个。
+**优先级：网页选择 > `.env` 的 `QWEN_VOICE` > 内置默认值。**
+想让配置文件说了算，删掉那个文件即可。
+
+**方式二：命令行**
+
 ```bash
 .venv/bin/python scripts/list_voices.py            # 看全部可选音色
 .venv/bin/python scripts/list_voices.py --sample   # 生成样音试听

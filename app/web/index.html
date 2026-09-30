@@ -148,6 +148,7 @@ h1{font-size:19px;margin:0;font-weight:600}
     <span class="pill" id="pModel">—</span>
     <span class="pill" id="pVoice">—</span>
     <div class="spacer"></div>
+    <button class="ghost" id="btnVoice">音色</button>
     <button class="ghost" id="btnProfile">我的画像</button>
     <button class="ghost" id="btnHistory">历史</button>
   </header>
@@ -263,6 +264,29 @@ h1{font-size:19px;margin:0;font-weight:600}
       <button class="ghost" id="btnCloseProfile">关闭</button>
     </div>
     <div id="profileBody"></div>
+  </div>
+</div>
+
+<div id="voiceModal" class="hidden"
+     style="position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:60;
+            display:flex;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="max-width:560px;width:100%;max-height:85vh;
+       overflow:auto">
+    <h2>AI 音色</h2>
+    <div class="hint" style="display:flex;align-items:center;gap:8px;
+         flex-wrap:wrap">
+      <span>点 ▶ 试听，选中后立即生效（下一轮对话开始用新音色）。</span>
+      <a id="voiceDocLink" href="#" target="_blank" rel="noopener"
+         style="color:var(--accent,#6cf);text-decoration:underline">
+        官方音色列表 ↗</a>
+    </div>
+    <div id="voiceList" style="display:flex;flex-direction:column;
+         gap:6px;margin:12px 0"></div>
+    <div class="hint" id="voiceNote"></div>
+    <div class="ctrls">
+      <div class="spacer"></div>
+      <button class="ghost" id="btnCloseVoice">关闭</button>
+    </div>
   </div>
 </div>
 
@@ -1181,6 +1205,126 @@ function openUserModal() {
   $("userModal").classList.remove("hidden");
   loadUsers();
 }
+
+// ============================================================
+//  音色选择
+// ============================================================
+//
+// 用户要能自己试、自己选，而不是只能接受默认的 Tina。
+//
+// 两个坑：
+//   1. 音色有两套清单（对话 / TTS），只有部分重叠。不能试听的
+//      音色要明确标出来，否则点了没反应像是坏了。
+//   2. 试听要走服务端代理合成 —— 浏览器直连百炼会被 CORS 挡掉，
+//      而且 Key 也不能暴露在前端。
+
+let voiceCache = null;
+let voiceAudio = null;
+
+async function openVoiceModal() {
+  $("voiceModal").classList.remove("hidden");
+  if (voiceCache) { renderVoices(voiceCache); return; }
+  $("voiceList").innerHTML = '<div class="hint">加载中…</div>';
+  try {
+    const r = await fetch("/api/voices");
+    voiceCache = await r.json();
+    renderVoices(voiceCache);
+  } catch (e) {
+    $("voiceList").innerHTML =
+      '<div class="hint">加载失败：' + esc(String(e)) + "</div>";
+  }
+}
+
+function renderVoices(d) {
+  $("voiceDocLink").href = d.doc_url || "#";
+  const list = $("voiceList");
+  list.innerHTML = "";
+  (d.voices || []).forEach(v => {
+    const cur = v.value === d.current;
+    const row = document.createElement("div");
+    row.style.cssText =
+      "display:flex;align-items:center;gap:10px;padding:8px 10px;" +
+      "border-radius:8px;cursor:pointer;" +
+      "background:" + (cur ? "rgba(110,200,255,.14)" : "rgba(255,255,255,.04)");
+    row.innerHTML =
+      '<span style="width:18px">' + (cur ? "✓" : "") + "</span>" +
+      '<span style="flex:1"><b>' + esc(v.name) + "</b>" +
+      '<span class="hint" style="margin-left:6px">' + esc(v.desc) +
+      "</span></span>" +
+      '<span class="hint" style="width:22px;text-align:center">' +
+      esc(v.gender || "") + "</span>" +
+      (v.sample
+        ? '<button class="ghost" data-play="' + esc(v.value) +
+          '" title="试听" style="padding:2px 10px">▶</button>'
+        : '<span class="hint" title="该音色不支持在线试听，' +
+          '可打开官方列表试听" style="width:38px;text-align:center">—</span>');
+    row.onclick = e => {
+      if (e.target.dataset && e.target.dataset.play) return;  // 点的是 ▶
+      setVoice(v.value);
+    };
+    list.appendChild(row);
+  });
+
+  const sampleCount = (d.voices || []).filter(v => v.sample).length;
+  $("voiceNote").textContent =
+    "共 " + (d.voices || []).length + " 个音色，其中 " + sampleCount +
+    " 个可在线试听。标 — 的音色只在实时对话模型里可用，" +
+    "语音合成模型没有，所以没法在线试听 —— 可以点上面的官方列表页试听。";
+}
+
+async function playVoice(voice, btn) {
+  const old = btn.textContent;
+  btn.textContent = "…"; btn.disabled = true;
+  try {
+    if (voiceAudio) { voiceAudio.pause(); voiceAudio = null; }
+    const r = await fetch("/api/voices/" + encodeURIComponent(voice) + "/sample");
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.detail || ("HTTP " + r.status));
+    }
+    const blob = await r.blob();
+    voiceAudio = new Audio(URL.createObjectURL(blob));
+    voiceAudio.onended = () => { btn.textContent = old; btn.disabled = false; };
+    await voiceAudio.play();
+  } catch (e) {
+    btn.textContent = old; btn.disabled = false;
+    toast("试听失败：" + (e.message || e));
+  }
+}
+
+async function setVoice(voice) {
+  try {
+    const r = await fetch("/api/voices/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ voice: voice })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "切换失败");
+    if (voiceCache) voiceCache.current = d.voice;
+    renderVoices(voiceCache || { voices: [], current: d.voice });
+    $("pVoice").textContent = d.voice;
+    toast("音色已切换为 " + d.voice);
+  } catch (e) {
+    toast("切换失败：" + (e.message || e));
+  }
+}
+
+$("btnVoice").onclick = openVoiceModal;
+$("btnCloseVoice").onclick = () => {
+  if (voiceAudio) { voiceAudio.pause(); voiceAudio = null; }
+  $("voiceModal").classList.add("hidden");
+};
+$("voiceModal").onclick = e => {
+  if (e.target === $("voiceModal")) $("btnCloseVoice").onclick();
+};
+$("voiceList").onclick = e => {
+  const t = e.target;
+  if (t.dataset && t.dataset.play) {
+    e.stopPropagation();
+    playVoice(t.dataset.play, t);
+  }
+};
 
 $("btnUser").onclick = openUserModal;
 $("btnCloseUser").onclick = () => $("userModal").classList.add("hidden");

@@ -39,77 +39,11 @@ def _opener() -> urllib.request.OpenerDirector:
         urllib.request.HTTPSHandler(context=ssl_context()))
 
 
-# ---------- 实时对话模型可选音色 ----------
-# 来源：百炼「非实时（Qwen-Omni）和实时（Qwen-Omni-Realtime）支持的音色列表」
-# 这些是**对话时** AI 说话的音色，即 .env 里 QWEN_VOICE 的取值。
-CHAT_VOICES: list[tuple[str, str]] = [
-    ("Tina",       "甜甜 Tina — 温热奶茶般甜暖（默认）"),
-    ("Cindy",      "林欣宜 Cindy — 台湾口音，嗲嗲的小姐姐"),
-    ("Liora Mira", "清欢 Liora Mira — 温柔，用声音织就烟火人间"),
-    ("Raymond",    "林川野 Raymond — 声音清亮的宅男"),
-    ("Zane",       "泽恩 Zane — 磁性迷人"),
-    ("Katerina",   "卡捷琳娜 Katerina — 御姐音，韵律回味十足"),
-    ("Ryan",       "甜茶 Ryan — 节奏拉满，戏感炸裂"),
-    ("Mia",        "舒然 Mia — 温柔生活博主，慢生活美学"),
-    ("Cici",       "绵绵 Cici — 邻家妹妹，声线软糯"),
-    ("Theo Calm",  "予安 Theo Calm — 沉静，在静默处传递理解"),
-    ("Serena",     "苏瑶 Serena — 温柔小姐姐"),
-    ("Maia",       "四月 Maia — 知性与温柔的碰撞"),
-    ("Evan",       "江晨 Evan — 男大学生"),
-    ("Qiao",       "小乔妹 Qiao — 表面甜妹，个性十足（台湾口音）"),
-    ("Momo",       "茉兔 Momo — 撒娇搞怪"),
-    ("Wil",        "伟伦 Wil — 深圳长大的港台腔小哥哥"),
-    ("Angel",      "安琪 Angel — 台式口音，很甜"),
-]
+from app.core.voices import (CHAT_VOICES as _CHAT, TTS_VOICES as _TTS,
+                             VOICE_DOC_URL)                 # noqa: E402
 
-# ---------- 语音合成（TTS）可用音色 ----------
-# 来源：百炼「Qwen-TTS音色列表」中 qwen3-tts-flash 支持的部分。
-# 试听样音只能用这里的名字合成。
-TTS_VOICES: list[tuple[str, str]] = [
-    ("Cherry",       "芊悦 — 阳光积极、亲切自然（女）"),
-    ("Serena",       "苏瑶 — 温柔小姐姐（女）"),
-    ("Ethan",        "晨煦 — 阳光温暖，带北方口音（男）"),
-    ("Chelsie",      "千雪 — 二次元虚拟女友（女）"),
-    ("Momo",         "茉兔 — 撒娇搞怪（女）"),
-    ("Vivian",       "十三 — 拽拽的可爱小暴躁（女）"),
-    ("Moon",         "月白 — 率性帅气（男）"),
-    ("Maia",         "四月 — 知性与温柔（女）"),
-    ("Kai",          "凯 — 耳朵的一场 SPA（男）"),
-    ("Nofish",       "不吃鱼 — 不会翘舌音的设计师（男）"),
-    ("Bella",        "萌宝 — 小萝莉（女）"),
-    ("Jennifer",     "詹妮弗 — 品牌级、电影质感美语女声（女）"),
-    ("Ryan",         "甜茶 — 节奏拉满，戏感炸裂（男）"),
-    ("Katerina",     "卡捷琳娜 — 御姐音（女）"),
-    ("Aiden",        "艾登 — 精通厨艺的美语大男孩（男）"),
-    ("Eldric Sage",  "沧明子 — 沉稳睿智的老者（男）"),
-    ("Mia",          "乖小妹 — 温顺乖巧（女）"),
-    ("Mochi",        "沙小弥 — 聪明伶俐的小大人（男）"),
-    ("Bellona",      "燕铮莺 — 声音洪亮，吐字清晰（女）"),
-    ("Vincent",      "田叔 — 沙哑烟嗓（男）"),
-    ("Bunny",        "萌小姬 — 萌属性爆棚（女）"),
-    ("Neil",         "阿闻 — 字正腔圆的新闻主持人（男）"),
-    ("Elias",        "墨讲师 — 把复杂知识讲清楚（女）"),
-    ("Arthur",       "徐大爷 — 质朴的乡音（男）"),
-    ("Nini",         "邻家妹妹 — 软糯（女）"),
-    ("Seren",        "小婉 — 温和舒缓，助眠（女）"),
-    ("Pip",          "顽屁小孩 — 调皮捣蛋（男）"),
-    ("Stella",       "少女阿月 — 迷糊少女（女）"),
-    ("Bodega",       "博德加 — 热情的西班牙大叔（男）"),
-    ("Sonrisa",      "索尼莎 — 热情开朗的拉美大姐（女）"),
-    ("Alek",         "阿列克 — 战斗民族的冷与暖（男）"),
-    ("Dolce",        "多尔切 — 慵懒的意大利大叔（男）"),
-    ("Sohee",        "素熙 — 温柔开朗的韩国欧尼（女）"),
-    ("Ono Anna",     "小野杏 — 鬼灵精怪的青梅竹马（女）"),
-    ("Lenn",         "莱恩 — 穿西装也听后朋克的德国青年（男）"),
-    ("Emilien",      "埃米尔安 — 浪漫的法国大哥哥（男）"),
-    ("Andre",        "安德雷 — 磁性沉稳（男）"),
-    ("Jada",         "上海-阿珍 — 沪上阿姐（女）"),
-    ("Dylan",        "北京-晓东 — 胡同少年（男）"),
-    ("Sunny",        "四川-晴儿 — 川妹子（女）"),
-    ("Eric",         "四川-程川 — 成都男子（男）"),
-    ("Rocky",        "粤语-阿强 — 幽默风趣（男）"),
-    ("Kiki",         "粤语-阿清 — 甜美港妹（女）"),
-]
+CHAT_VOICES = [(v, f"{name} — {desc}") for v, name, desc, _g in _CHAT]
+TTS_VOICES = [(v, "") for v in _TTS]
 
 SAMPLE_TEXT = ("Hey! I'm your English speaking partner. "
                "Let's talk about how your week has been going. "
@@ -157,7 +91,9 @@ def main() -> None:
         print(f"\n【可试听音色】{len(TTS_VOICES)} 个 —— 能合成样音的名"
               f"（与上面部分重叠）")
         print("      这些是 TTS 模型支持的，用它来听效果。")
-        print("\n改 .env 里的 QWEN_VOICE 即可切换（改完重启服务）。")
+        print(f"\n官方音色列表：{VOICE_DOC_URL}")
+        print("网页上也可以直接选：点右上角「音色」按钮（可试听）。")
+        print("命令行切换：改 .env 里的 QWEN_VOICE，改完重启服务。")
         print("先听一下：.venv/bin/python scripts/list_voices.py --sample Tina Serena Ryan")
         return
 

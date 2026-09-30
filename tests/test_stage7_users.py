@@ -1444,3 +1444,77 @@ def test_voice_samples_dir_is_gitignored():
     root = Path(__file__).resolve().parent.parent
     gi = (root / ".gitignore").read_text(encoding="utf-8")
     assert "data" in gi, "data/ 应被忽略"
+
+
+def test_voices_api_lists_all_and_flags_sampleable():
+    """/api/voices 要给出全部音色，并标明哪些能试听。"""
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "lv2", root / "scripts" / "list_voices.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    from app.core.voices import CHAT_VOICES, VOICE_DOC_URL, can_sample
+
+    assert len(CHAT_VOICES) == 17
+    assert VOICE_DOC_URL.startswith("https://help.aliyun.com/")
+    # 每个音色都要有 值/名/描述/性别 四项，前端才能渲染
+    for row in CHAT_VOICES:
+        assert len(row) == 4, row
+    # 必须有能试听的，否则试听功能形同虚设
+    assert sum(1 for r in CHAT_VOICES if can_sample(r[0])) >= 5
+
+
+def test_voice_select_endpoint_exists():
+    """网页上切换音色需要 POST /api/voices/select。"""
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "api" / "server.py").read_text(encoding="utf-8")
+    assert '"/api/voices/select"' in src
+    assert '"/api/voices"' in src
+    assert "/sample" in src
+
+
+def test_web_choice_beats_env():
+    """界面选择必须压过 .env，否则点了音色重启后又变回去。
+
+    这是实测发现的：.env 里有 QWEN_VOICE=Jennifer，界面上选了
+    Serena、提示"已切换"，重启后却回到 Jennifer —— 看起来就是
+    "点了没用"。
+    """
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "api" / "server.py").read_text(encoding="utf-8")
+    # 不能出现"有 QWEN_VOICE 就跳过覆盖"这种逻辑
+    assert "not os.environ.get(\"QWEN_VOICE\")" not in src, \
+        "界面选择被 .env 压过了，用户点了会看起来没生效"
+
+
+def test_voice_ui_has_doc_link_and_buttons():
+    """音色面板要有官方列表链接和试听按钮。"""
+    import re as _re
+
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    # 去掉注释再断言，避免注释里的字样蒙混过关
+    code = _re.sub(r"//[^\n]*", "", html)
+    for token in ("btnVoice", "voiceModal", "btnCloseVoice"):
+        assert token in code, f"缺少 {token}"
+    assert "voiceDocLink" in code, "音色面板要有官方列表链接"
+    assert "doc_url" in code, "链接地址应由后端下发，不写死在前端"
+
+
+def test_no_chinese_identifiers_in_frontend():
+    """前端别用中文变量名 —— 虽然合法，但容易在别处解析出错。
+
+    实测：写了 `const 可试 = ...`，Node 下报 可试 is not defined。
+    """
+    import re as _re
+
+    html = (Path(__file__).resolve().parent.parent
+            / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    code = _re.sub(r"//[^\n]*", "", html)
+    code = _re.sub(r"<[^>]+>", "", code)
+    # 找 const/let/var 后面跟中文标识符
+    bad = _re.findall(r"\b(?:const|let|var)\s+([\u4e00-\u9fff]\w*)", code)
+    assert not bad, f"前端出现中文变量名：{bad}"

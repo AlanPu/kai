@@ -11,17 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import logging
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ..core.config import Settings, load_settings
+from ..core.config import Settings, load_settings, ssl_context
 from ..core.content import load_content
 from ..core.enroll import (DEFAULT_PROMPTS_LIST, MIN_SAMPLES,
                            EnrollmentSession)
@@ -55,15 +56,55 @@ WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 # 实际取值以 Settings 为准（见 _timer_loop）。
 IDLE_NUDGE_SEC = 15.0
 
+# 试听样音说的句子。选一段贴近真实练习场景的英文，
+# 这样听到的效果和实际对话时接近。
+SAMPLE_TEXT = ("Hey! I'm your English speaking partner. "
+               "Let's talk about how your week has been going. "
+               "Don't worry about making mistakes — that's how we learn.")
+
+def build_opener():
+    """国内服务直连：绕过代理，否则可能超时。"""
+    import ssl as _ssl
+    import urllib.request as _ur
+    return _ur.build_opener(
+        _ur.ProxyHandler({}),
+        _ur.HTTPSHandler(context=ssl_context()))
+
+
 app = FastAPI(title="英语口语陪练")
 _settings: Optional[Settings] = None
 _db: Optional[Database] = None
+
+
+def _voice_override_file():
+    return settings().db_path.parent / "voice_override.txt"
 
 
 def settings() -> Settings:
     global _settings
     if _settings is None:
         _settings = load_settings()
+        # 网页上选过音色就以它为准。
+        #
+        # 优先级：网页选择 > .env 的 QWEN_VOICE > 内置默认值。
+        #
+        # 为什么网页选择要压过 .env：
+        #   用户在界面上点了一个音色，界面立刻显示"已切换"，
+        #   但如果 .env 里恰好有 QWEN_VOICE，重启后就悄悄变回去了 ——
+        #   看起来就是"点了没用"。这个功能存在的意义就是免去改配置，
+        #   所以界面选择必须是最后一手。
+        #   想让配置文件说了算，就把 data/voice_override.txt 删掉。
+        try:
+            f = _voice_override_file()
+            if f.is_file():
+                v = f.read_text(encoding="utf-8").strip()
+                if v:
+                    import dataclasses
+                    _settings = dataclasses.replace(_settings, qwen_voice=v)
+                    log.info("音色沿用网页上的选择：%s（删除 %s 可恢复 .env 设置）",
+                             v, f)
+        except OSError:
+            pass
     return _settings
 
 
@@ -230,6 +271,108 @@ async def health():
         "voiceprint": any(u.has_voiceprint
                           for u in user_store().list_users()),
     }
+
+
+@app.get("/api/voices")
+async def voices():
+    """可选音色清单，供网页版的选择列表使用。
+
+    同时告诉前端：哪些音色能在线试听 —— 对话音色和 TTS 音色只有
+    部分重叠，不能试听的名字前端会标出来，避免点了没反应。
+    """
+    from app.core.voices import (CHAT_VOICES, VOICE_DOC_URL, can_sample)
+
+    s = settings()
+    return {
+        "current": s.qwen_voice,
+        "doc_url": VOICE_DOC_URL,
+        "voices": [
+            {"value": v, "name": name, "desc": desc, "gender": g,
+             "sample": can_sample(v)}
+            for v, name, desc, g in CHAT_VOICES
+        ],
+    }
+
+
+class VoiceIn(BaseModel):
+    voice: str
+
+
+@app.post("/api/voices/select")
+async def select_voice(body: VoiceIn):
+    """切换音色，立即生效（不用改 .env 再重启）。
+
+    为什么要运行时切换：
+        音色是最"个人偏好"的一项 —— 必须听几个才能决定。
+        如果每次都要改配置文件、重启服务，试错成本太高，
+        用户就不会去试了。
+
+    实现方式：Settings 是 frozen 的，不直接改它，而是记一个
+    运行期覆盖值，并写进 data/voice_override.txt。
+        选一次就永久记住，重启后仍然是你选的那个 —— 否则
+        每次重启都退回 .env 的默认值，等于没选。
+    改 .env 里的 QWEN_VOICE 依然有效，会覆盖掉这个记忆值。
+    """
+    from app.core.voices import chat_voice_names
+
+    v = (body.voice or "").strip()
+    if v not in chat_voice_names():
+        raise HTTPException(400, f"未知音色：{v}")
+
+    # 记住选择
+    path = settings().db_path.parent / "voice_override.txt"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(v, encoding="utf-8")
+    except OSError as e:
+        log.warning("音色偏好写入失败：%s", e)
+
+    # 让当前进程也用上新值
+    global _settings
+    import dataclasses
+    _settings = dataclasses.replace(settings(), qwen_voice=v)
+    log.info("音色已切换为 %s", v)
+    return {"ok": True, "voice": v}
+
+
+@app.get("/api/voices/{voice}/sample")
+async def voice_sample(voice: str):
+    """合成一小段该音色的英文样音，让用户试听后再决定。
+
+    用 TTS 模型合成（不是实时对话模型），所以只有 TTS 清单里的
+    音色能用。不在清单里就明确告诉用户为什么，而不是返回一个
+    看不懂的 Invalid voice specified。
+    """
+    from app.core.voices import can_sample
+
+    if not can_sample(voice):
+        raise HTTPException(400, f"音色 {voice} 不支持试听："
+                                 f"它只在实时对话模型里可用，"
+                                 f"语音合成模型没有这个音色。"
+                                 f"可以打开官方音色列表页试听。")
+    s = settings()
+    if not s.has_text_credentials():
+        raise HTTPException(400, "未配置 DASHSCOPE_API_KEY")
+
+    import urllib.request as _ur
+
+    payload = {"model": "qwen3-tts-flash",
+               "input": {"text": SAMPLE_TEXT, "voice": voice}}
+    req = _ur.Request(
+        "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+        "multimodal-generation/generation",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {s.dashscope_api_key}",
+                 "Content-Type": "application/json"})
+    try:
+        with build_opener().open(req, timeout=60) as r:
+            url = json.load(r)["output"]["audio"]["url"]
+        with build_opener().open(url, timeout=60) as r:
+            audio = r.read()
+    except Exception as e:                       # noqa: BLE001
+        raise HTTPException(502, f"合成失败：{e}") from e
+
+    return Response(content=audio, media_type="audio/wav")
 
 
 @app.get("/api/stats")
