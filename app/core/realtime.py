@@ -205,6 +205,14 @@ class RealtimeSession:
         """打断 AI 当前回复（用户抢话时用）。"""
         await self._send({"type": "response.cancel"})
 
+    async def commit_audio(self) -> None:
+        """提交当前输入音频缓冲。
+
+        必须显式提交，服务端才会把这段音频变成一个 conversation item，
+        之后 response.create 才有内容可回应。
+        """
+        await self._send({"type": "input_audio_buffer.commit"})
+
     async def request_response(self, instructions: Optional[str] = None) -> None:
         """
         主动要求模型开口。
@@ -396,6 +404,16 @@ def extract_ai_text(ev: dict) -> Optional[str]:
 
 def is_speech_started(ev: dict) -> bool:
     return ev.get("type") == "input_audio_buffer.speech_started"
+
+
+def is_speech_stopped(ev: dict) -> bool:
+    """服务端 VAD 判定用户说完了。
+
+    这是「该 AI 接话」的信号。实测 Qwen 不会因为
+    turn_detection.create_response=True 就自动回应，
+    必须据此显式 commit + response.create（见 session.py）。
+    """
+    return ev.get("type") == "input_audio_buffer.speech_stopped"
 
 
 def is_response_done(ev: dict) -> bool:

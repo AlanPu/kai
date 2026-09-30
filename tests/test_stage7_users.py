@@ -730,3 +730,62 @@ def test_frontend_enroll_commands_use_type_field():
     for s in sends:
         assert "type:" in s, f"前端指令应带 type 字段，实际: {s}"
         assert "cmd:" not in s, f"前端不应使用 cmd 字段，实际: {s}"
+
+
+def test_speech_stopped_helper_exists_and_matches_event():
+    """必须有识别「用户说完」的辅助函数。
+
+    这是 AI 接话的触发点。历史上只处理了 speech_started，
+    导致用户说完一句后 AI 永远不主动回应 —— 必须再说一句"继续"。
+    """
+    from app.core.realtime import is_speech_started, is_speech_stopped
+
+    assert is_speech_stopped({"type": "input_audio_buffer.speech_stopped"})
+    assert not is_speech_stopped({"type": "input_audio_buffer.speech_started"})
+    assert is_speech_started({"type": "input_audio_buffer.speech_started"})
+    assert not is_speech_started({"type": "input_audio_buffer.speech_stopped"})
+
+
+def test_session_triggers_response_on_speech_stopped():
+    """用户说完后必须显式触发 AI 回应。
+
+    实测 Qwen 即使 turn_detection.create_response=True，
+    也不会在 speech_stopped 时自动生成回复。所以必须手动
+    commit + response.create，否则表现为"AI 不接话"。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "services" / "session.py").read_text(encoding="utf-8")
+    assert "is_speech_stopped(ev)" in src, "session 没有处理 speech_stopped"
+    assert "_respond_after_turn" in src, "缺少接话逻辑"
+    assert "commit_audio" in src, \
+        "必须先 commit 音频再 response.create，否则服务端会忽略"
+
+
+def test_realtime_exposes_commit_audio():
+    """RealtimeSession 要提供 commit_audio。"""
+    from app.core.realtime import RealtimeSession
+
+    assert hasattr(RealtimeSession, "commit_audio"), "缺少 commit_audio 方法"
+
+
+def test_respond_after_turn_waits_before_creating_response():
+    """commit 和 response.create 之间必须有等待。
+
+    实测 commit 后立刻 create 会被服务端忽略，现象和没修一样。
+    这个测试锁住那个等待，防止有人"优化"掉。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "services" / "session.py").read_text(encoding="utf-8")
+    body = src[src.index("async def _respond_after_turn"):]
+    body = body[:body.index("async def _on_user_text")]
+    assert "commit_audio" in body and "request_response" in body
+    assert re.search(r"await asyncio\.sleep\(0\.[1-9]", body), \
+        "commit 与 response.create 之间缺少等待"
+    assert body.index("commit_audio") < body.index("request_response"), \
+        "必须先 commit 再 request_response"

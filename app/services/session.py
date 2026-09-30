@@ -21,7 +21,8 @@ from ..core.config import Settings
 from ..core.realtime import (RealtimeSession, SessionFatal, extract_ai_text,
                              is_recoverable_error,
                              extract_audio_delta, extract_transcript,
-                             is_fatal_error, is_speech_started)
+                             is_fatal_error, is_speech_started,
+                             is_speech_stopped)
 from ..core.voiceprint import SpeakerVerifier
 from ..storage.db import Database
 from ..storage.models import Correction, Turn
@@ -132,6 +133,8 @@ class ConversationSession:
         self._pending: list[bytes] = []
         # AI 正在说话时暂停声纹判定（否则会把 AI 自己的声音当输入）
         self._model_speaking = False
+        # 用户当前是否正在说话（由服务端 VAD 的 started/stopped 维护）
+        self._user_speaking = False
         self._user_buf: list[str] = []
         self._correction_tasks: set[asyncio.Task] = set()
 
@@ -335,8 +338,32 @@ class ConversationSession:
             #
             # 正确语义：speech_started 意味着「轮到用户」，AI 要闭嘴。
             self._model_speaking = False
+            self._user_speaking = True
             self.stats.user_speech_starts += 1
             await self.on_client({"type": "user_speaking"})
+            return
+
+        if is_speech_stopped(ev):
+            # 用户说完一句 —— 该 AI 接话了。
+            #
+            # 为什么必须在这里显式触发，而不能靠 turn_detection 的
+            # create_response=True：
+            #
+            # 实测（Qwen cn-beijing，qwen3.8-omni-flash-realtime）：
+            # 即使 create_response=True，服务端也只在 speech_stopped 时
+            # 发 committed，并不会自己生成回复。结果是用户说完一句、
+            # 停在那儿等，AI 一直不吭声 —— 必须再说一句"继续"才动。
+            # 这正是用户反馈的"不像真人对话"。
+            #
+            # 可靠做法是手动两步：先 commit 音频缓冲，再 response.create。
+            # 官方文档里这两个事件都是给客户端手动控制轮流用的；
+            # 只要发了 commit，即便 create_response=True 也不会重复触发。
+            #
+            # 延迟：commit 之后不能立刻 response.create，要等服务端把
+            # 音频 item 落库（实测 0.4~0.6 秒）。发太早会被忽略，
+            # 现象和没修一样 —— 这里踩过。
+            self._user_speaking = False
+            asyncio.create_task(self._respond_after_turn())
             return
 
         if t == "response.created":
@@ -359,6 +386,26 @@ class ConversationSession:
         if ai:
             await self._on_ai_text(ai)
             return
+
+    async def _respond_after_turn(self) -> None:
+        """用户说完后，让 AI 接话。
+
+        顺序很重要：先 commit，等音频 item 真正落库，再 response.create。
+        实测 commit 后立刻 create 会被忽略（服务端还没处理完音频），
+        现象就是"AI 还是不吭声" —— 和没修一模一样。
+        """
+        try:
+            await asyncio.sleep(0.05)          # 让 speech_stopped 后续事件先走完
+            if self._model_speaking or self.ended or not self.rt:
+                return                          # 用户又开口了，或会话已结束
+            await self.rt.commit_audio()
+            await asyncio.sleep(0.5)            # 等音频 item 落库
+            if self._model_speaking or self.ended or not self.rt:
+                return
+            await self.rt.request_response()
+        except Exception as e:                   # noqa: BLE001
+            # 接话失败不该让整场练习崩掉：用户还能自己继续说
+            log.warning("触发 AI 接话失败: %s", e)
 
     async def _on_user_text(self, text: str) -> None:
         """用户说完一句：入库、回推、异步纠错。"""
