@@ -1,0 +1,658 @@
+"""
+阶段 7 测试：多用户与声纹重录。
+
+背景：多人共用一台电脑各自练习。要求每个用户有独立的
+声纹、画像和练习记录；声纹可以随时重录、也可以只清声纹
+而保留画像历史。
+"""
+
+import json
+
+import numpy as np
+import pytest
+
+from app.core.enroll import (MAX_SPEECH_SEC, MIN_COHERENCE, MIN_SAMPLES,
+                             MIN_SPEECH_SEC, EnrollmentSession)
+from app.services.users import (DuplicateUser, InvalidUser, UserNotFound,
+                                UserStore, quality_label)
+from app.storage.db import Database
+from app.storage.models import ProfileFact
+
+
+@pytest.fixture
+def db(tmp_path):
+    d = Database(tmp_path / "u.db")
+    d.init_schema()
+    yield d
+    d.close()
+
+
+@pytest.fixture
+def store(db, tmp_path):
+    return UserStore(db, tmp_path / "voiceprints")
+
+
+# ============================================================
+#  用户增删改查
+# ============================================================
+
+def test_create_and_get(store):
+    u = store.create("Alan", "🐧")
+    assert u.id > 0
+    assert u.name == "Alan"
+    assert u.avatar == "🐧"
+    assert not u.has_voiceprint
+    assert store.get(u.id).name == "Alan"
+
+
+def test_create_strips_whitespace(store):
+    u = store.create("  小明  ")
+    assert u.name == "小明"
+
+
+def test_duplicate_name_rejected(store):
+    store.create("Alan")
+    with pytest.raises(DuplicateUser):
+        store.create("Alan")
+
+
+def test_duplicate_name_exact_match_rejected(store):
+    """完全同名的必须拒绝。"""
+    store.create("Alan")
+    with pytest.raises(DuplicateUser):
+        store.create("Alan")
+
+
+def test_similar_names_allowed(store):
+    """'Alan' 和 'alan' 目前算两个用户。
+
+    这是已知的粗糙之处：界面上两个名字看起来一样，容易选错。
+    没做大小写归一化是因为中文名没有大小写概念，强行 lower()
+    会影响 'Li' / 'li' 这类确实想区分的情形。先如实记录行为。
+    """
+    store.create("Alan")
+    u = store.create("alan")
+    assert u.name == "alan"
+
+
+def test_empty_name_rejected(store):
+    for bad in ["", "   ", "\t\n"]:
+        with pytest.raises(InvalidUser):
+            store.create(bad)
+
+
+def test_overlong_name_rejected(store):
+    with pytest.raises(InvalidUser):
+        store.create("x" * 100)
+
+
+def test_rename(store):
+    u = store.create("Alan")
+    v = store.rename(u.id, "Alan Pu", "🚀")
+    assert v.name == "Alan Pu"
+    assert v.avatar == "🚀"
+
+
+def test_rename_to_existing_rejected(store):
+    a = store.create("Alan")
+    store.create("Bob")
+    with pytest.raises(DuplicateUser):
+        store.rename(a.id, "Bob")
+
+
+def test_rename_missing_raises(store):
+    with pytest.raises(UserNotFound):
+        store.rename(999, "Nobody")
+
+
+def test_require_missing_raises(store):
+    with pytest.raises(UserNotFound):
+        store.require(999)
+
+
+def test_default_user_is_most_recently_used(store, db):
+    a = store.create("A")
+    store.create("B")
+    # 同一秒内创建的两个用户时间戳会并列，所以这里靠显式 touch
+    # 来验证"最近使用"的语义，而不是靠创建顺序
+    db.touch_user(a.id)
+    assert store.default_user().id == a.id
+    db.touch_user(store.get_by_name("B").id)
+    assert store.default_user().name == "B"
+
+
+def test_default_user_none_when_empty(store):
+    assert store.default_user() is None
+
+
+def test_list_users_orders_by_recent_use(store, db):
+    a = store.create("A")
+    store.create("B")
+    db.touch_user(a.id)
+    assert [u.name for u in store.list_users()][0] == "A"
+
+
+def test_resolve_returns_none_for_zero(store):
+    """resolve(0) 用于"前端还没选用户"的情形，不该抛异常。"""
+    assert store.resolve(0) is None
+    assert store.resolve(None) is None
+
+
+# ============================================================
+#  声纹文件读写
+# ============================================================
+
+def test_save_and_load_voiceprint(store, tmp_path):
+    u = store.create("Alan")
+    proto = np.ones(192, dtype=np.float32) / np.sqrt(192)
+    store.save_voiceprint(u.id, proto, quality=0.88, samples=4)
+
+    assert store.has_voiceprint(u.id)
+    got, meta = store.load_voiceprint(u.id)
+    assert got is not None
+    assert len(got) == 192
+    assert meta["quality"] == pytest.approx(0.88)
+    assert meta["samples"] == 4
+    # 存储的路径必须按 user_id 隔离
+    assert store.voiceprint_path(u.id).name == f"{u.id}.json"
+
+
+def test_voiceprints_do_not_collide(store):
+    """两个用户的声纹文件必须分开 —— 这是多用户的核心正确性。"""
+    a = store.create("A")
+    b = store.create("B")
+    store.save_voiceprint(a.id, np.ones(192, dtype=np.float32), quality=0.9,
+                          samples=3)
+    store.save_voiceprint(b.id, np.full(192, -1, dtype=np.float32),
+                          quality=0.5, samples=3)
+
+    va, _ = store.load_voiceprint(a.id)
+    vb, _ = store.load_voiceprint(b.id)
+    assert va[0] > 0 and vb[0] < 0, "两个用户的声纹串了"
+    assert store.voiceprint_path(a.id) != store.voiceprint_path(b.id)
+
+
+def test_load_missing_voiceprint_returns_none(store):
+    u = store.create("A")
+    proto, meta = store.load_voiceprint(u.id)
+    assert proto is None
+    assert meta == {}
+
+
+def test_save_creates_parent_dir(store, tmp_path):
+    u = store.create("A")
+    store.save_voiceprint(u.id, np.ones(192, dtype=np.float32), quality=0.9, samples=3)
+    assert store.voiceprint_path(u.id).is_file()
+
+
+def test_save_is_atomic(store):
+    """先写临时文件再 replace —— 中途崩溃不该留下半个 JSON。"""
+    u = store.create("A")
+    store.save_voiceprint(u.id, np.ones(192, dtype=np.float32),
+                          quality=0.7, samples=3)
+    p = store.voiceprint_path(u.id)
+    assert not p.with_suffix(".json.tmp").exists()
+    json.loads(p.read_text())        # 必须是合法 JSON
+
+
+def test_save_keeps_raw_embeddings(store):
+    """存原始句向量，将来换算法/换阈值时能重新推导，
+    不必让用户重录。"""
+    u = store.create("A")
+    embs = [np.ones(192, dtype=np.float32), np.full(192, 0.5, dtype=np.float32)]
+    store.save_voiceprint(u.id, np.ones(192, dtype=np.float32), quality=0.9,
+                          samples=2, raw_embeddings=embs)
+    _, meta = store.load_voiceprint(u.id)
+    assert len(meta["embeddings"]) == 2
+
+
+def test_reenroll_overwrites(store):
+    """重新录入必须覆盖旧的，而不是叠加。"""
+    u = store.create("A")
+    store.save_voiceprint(u.id, np.ones(192, dtype=np.float32), quality=0.5,
+                          samples=3)
+    store.save_voiceprint(u.id, np.full(192, -1, dtype=np.float32),
+                          quality=0.95, samples=5)
+    _, meta = store.load_voiceprint(u.id)
+    assert meta["quality"] == pytest.approx(0.95)
+    assert meta["samples"] == 5
+
+
+def test_clear_voiceprint_keeps_user(store):
+    """只清声纹、保留画像历史 —— 换了麦克风想重录的常见场景。"""
+    u = store.create("A")
+    store.save_voiceprint(u.id, np.ones(192, dtype=np.float32),
+                          quality=0.9, samples=3)
+    store.clear_voiceprint(u.id)
+
+    assert not store.has_voiceprint(u.id)
+    assert not store.voiceprint_path(u.id).exists()
+    assert store.get(u.id) is not None      # 用户还在
+
+
+def test_voiceprint_info_shape(store):
+    u = store.create("A")
+    info = store.voiceprint_info(u.id)
+    assert info["has"] is False
+    assert info["quality_label"] == "未录入"
+
+    store.save_voiceprint(u.id, np.ones(192, dtype=np.float32), quality=0.8,
+                          samples=4)
+    info = store.voiceprint_info(u.id)
+    assert info["has"] is True
+    assert info["samples"] == 4
+
+
+def test_quality_label_thresholds():
+    assert quality_label(None) == "未录入"
+    assert quality_label(0.9) == "好"
+    assert quality_label(0.65) == "一般"
+    assert quality_label(0.3) == "偏差"
+
+
+# ============================================================
+#  数据隔离与级联删除
+# ============================================================
+
+def test_sessions_are_isolated(store, db):
+    a = store.create("A")
+    b = store.create("B")
+    db.create_session(a.id, "topic", "A 的话题")
+    db.create_session(b.id, "topic", "B 的话题")
+
+    sa = db.list_sessions(user_id=a.id)
+    sb = db.list_sessions(user_id=b.id)
+    assert [s.input_raw for s in sa] == ["A 的话题"]
+    assert [s.input_raw for s in sb] == ["B 的话题"]
+
+
+def test_same_key_facts_coexist(store, db):
+    """两个用户可以有同名但不同值的事实，不能互相覆盖。"""
+    a = store.create("A")
+    b = store.create("B")
+    db.upsert_fact(ProfileFact(user_id=a.id, category="background",
+                               key="职业", value="工程师", confidence=0.9))
+    db.upsert_fact(ProfileFact(user_id=b.id, category="background",
+                               key="职业", value="设计师", confidence=0.9))
+
+    fa = db.list_facts(user_id=a.id)
+    fb = db.list_facts(user_id=b.id)
+    assert len(fa) == 1 and fa[0].value == "工程师"
+    assert len(fb) == 1 and fb[0].value == "设计师"
+
+
+def test_upsert_same_user_still_merges(store, db):
+    """同一用户的同 key 事实仍应合并并提升置信度，不是插入两条。"""
+    a = store.create("A")
+    f = ProfileFact(user_id=a.id, category="interest", key="hobby",
+                    value="跑步", confidence=0.5)
+    db.upsert_fact(f)
+    db.upsert_fact(f)
+    got = db.list_facts(user_id=a.id)
+    assert len(got) == 1
+    assert got[0].confidence > 0.5
+
+
+def test_delete_user_removes_everything(store, db):
+    a = store.create("A")
+    b = store.create("B")
+    sa = db.create_session(a.id, "topic", "A")
+    db.create_session(b.id, "topic", "B")
+    db.upsert_fact(ProfileFact(user_id=a.id, category="interest",
+                               key="k", value="v", confidence=0.9))
+    store.save_voiceprint(a.id, np.ones(192, dtype=np.float32), quality=0.9, samples=3)
+
+    stats = store.delete(a.id)
+    assert stats["sessions"] == 1
+    assert stats["facts"] == 1
+
+    assert store.get(a.id) is None
+    assert not store.voiceprint_path(a.id).exists()
+    assert db.list_sessions(user_id=a.id) == []
+    assert db.list_facts(user_id=a.id) == []
+    # 另一个用户完全不受影响
+    assert len(db.list_sessions(user_id=b.id)) == 1
+    assert store.get(b.id) is not None
+    assert sa > 0
+
+
+def test_delete_removes_profile_markdown(store, db, tmp_path):
+    from app.services.profile import ProfileStore
+    ps = ProfileStore(db, tmp_path / "profiles")
+    a = store.create("A")
+    db.upsert_fact(ProfileFact(user_id=a.id, category="interest",
+                               key="k", value="v", confidence=0.9))
+    ps.write_markdown(a.id)
+    assert ps.markdown_path(a.id).is_file()
+
+    store.delete(a.id)
+    assert not ps.markdown_path(a.id).exists()
+
+
+def test_delete_missing_raises(store):
+    with pytest.raises(UserNotFound):
+        store.delete(999)
+
+
+def test_count_user_data(store, db):
+    a = store.create("A")
+    db.create_session(a.id, "topic", "x")
+    c = db.count_user_data(a.id)
+    assert c["sessions"] == 1
+    assert set(c) >= {"sessions", "turns", "corrections", "facts"}
+
+
+# ============================================================
+#  声纹录入
+# ============================================================
+
+class FakeExtractor:
+    """
+    假的 sherpa 特征提取器，接口与 SpeakerEmbeddingExtractor 一致：
+    create_stream() 造流，accept_waveform() 喂音频，compute(stream) 出向量。
+
+    向量由音频的均值和标准差组成 —— 对"同一段音频重复提交"给出
+    完全相同的向量，对音量差别很大的音频给出方向很不同的向量，
+    因此能确定性地验证录入流程的判据（而非验证模型本身）。
+    """
+
+    def create_stream(self):
+        return _Stream()
+
+    def compute(self, stream):
+        return stream.vec
+
+
+class _Stream:
+    def __init__(self):
+        self.vec = None
+        self._chunks = []
+
+    def accept_waveform(self, rate, samples):
+        self._chunks.append(np.asarray(samples, dtype=np.float32))
+
+    def input_finished(self):
+        x = np.concatenate(self._chunks) if self._chunks else np.zeros(1)
+        v = np.zeros(8, dtype=np.float32)
+        v[0] = float(np.mean(np.abs(x))) + 1e-6
+        v[1] = float(np.std(x)) + 1e-6
+        v[2] = 1.0
+        n = float(np.linalg.norm(v))
+        self.vec = v / n
+
+
+class FakeVerifier:
+    """只暴露 .ex，和 SpeakerVerifier 一样。"""
+
+    def __init__(self):
+        self.ex = FakeExtractor()
+
+
+@pytest.fixture
+def fake_verifier():
+    return FakeVerifier()
+
+
+def _speech(sec, amp=4000):
+    """一段像语音的音频：带包络的噪声，避免被判成静音。"""
+    n = int(16000 * sec)
+    rng = np.random.default_rng(42)
+    x = rng.normal(0, amp, n)
+    env = np.sin(np.linspace(0, np.pi, n))
+    return (x * env).astype(np.int16)
+
+
+def test_enroll_rejects_too_short(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    s.feed(_speech(MIN_SPEECH_SEC / 2))
+    r = s.commit()
+    assert not r.ok
+    assert "短" in r.reason
+
+
+def test_enroll_rejects_silence(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    s.feed(np.zeros(16000 * 5, dtype=np.int16))
+    r = s.commit()
+    assert not r.ok
+    assert "安静" in r.reason or "声音" in r.reason
+
+
+def test_enroll_accepts_valid_and_advances(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    s.feed(_speech(3))
+    r = s.commit()
+    assert r.ok
+    # current 是 0-based 内部计数（第几句已经录完），
+    # 对外的 progress() 才 +1 显示成 1-based
+    assert s.current == 1
+    assert s.progress()["current"] == 2
+    assert len(s.embeddings) == 1
+
+
+def test_enroll_does_not_overrun_total(store, fake_verifier):
+    """多按一次"读完了"不该把进度推过总句数 —— 之前踩过的越界。"""
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier, prompts=None)
+    total = s.total
+    for _ in range(total + 5):
+        s.feed(_speech(3))
+        s.commit()
+    assert s.current <= total + 1
+    assert s.finished
+
+
+def test_enroll_buffer_cleared_after_commit(store, fake_verifier):
+    """提交后必须清空缓冲，否则下一句会把上一句的音频也算进去。"""
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    s.feed(_speech(3))
+    s.commit()
+    assert s.buffered_sec() == 0
+
+
+def test_enroll_truncates_overlong(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    s.feed(_speech(MAX_SPEECH_SEC + 5))
+    r = s.commit()
+    assert r.ok
+    assert r.speech_sec <= MAX_SPEECH_SEC + 0.1
+
+
+def test_enroll_discard_clears_without_advancing(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    s.feed(_speech(3))
+    s.clear_buffer()
+    assert s.buffered_sec() == 0
+    assert s.current == 0          # 没有推进
+    assert len(s.embeddings) == 0
+
+
+def test_enroll_cannot_save_before_min_samples(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    for _ in range(MIN_SAMPLES - 1):
+        s.feed(_speech(3))
+        s.commit()
+    assert not s.can_save(), "样本不足时不该允许保存"
+
+
+def test_enroll_can_save_at_min_samples(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    for _ in range(MIN_SAMPLES):
+        s.feed(_speech(3))
+        s.commit()
+    assert s.can_save()
+
+
+def test_enroll_prototype_is_normalized(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    for _ in range(MIN_SAMPLES):
+        s.feed(_speech(3))
+        s.commit()
+    p = s.prototype()
+    assert p is not None
+    assert np.linalg.norm(p) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_enroll_rejects_incoherent_samples(store):
+    """中途换了个人 → 样本互相矛盾，应当拒绝并提示重录。
+
+    用一个每次给完全不同方向的假提取器来模拟"换人了"。
+    """
+    class FlipExtractor:
+        """第一句给 +x，之后给 -x，两次向量的余弦 = -1。"""
+        def __init__(self):
+            self.n = 0
+
+        def create_stream(self):
+            self.n += 1
+            return _FlipStream(self.n == 1)
+
+        def compute(self, st):
+            return st.vec
+
+    class _FlipStream:
+        def __init__(self, first):
+            self.first = first
+            self.vec = None
+
+        def accept_waveform(self, rate, samples):
+            pass
+
+        def input_finished(self):
+            v = np.zeros(8, dtype=np.float32)
+            v[0] = 1.0 if self.first else -1.0
+            self.vec = v
+
+    class FlipVerifier:
+        """EnrollmentSession 只通过 .ex 拿提取器。"""
+        def __init__(self):
+            self.ex = FlipExtractor()
+
+    s = EnrollmentSession(user_id=1, verifier=FlipVerifier())
+    s.feed(_speech(3))
+    assert s.commit().ok, "第一句应当通过"
+    s.feed(_speech(3))
+    r = s.commit()
+    assert not r.ok, "第二句与第一句方向完全相反，应当被拒绝"
+    assert "差别" in r.reason or "一致" in r.reason
+    assert len(s.embeddings) == 1, "被拒绝的样本不该进入 embeddings"
+
+
+def test_enroll_progress_shape(store, fake_verifier):
+    s = EnrollmentSession(user_id=1, verifier=fake_verifier)
+    p = s.progress()
+    assert set(p) >= {"current", "total", "collected", "prompt"}
+    assert p["current"] == 1
+    assert p["collected"] == 0
+    assert s.total >= MIN_SAMPLES
+
+
+# ============================================================
+#  参数标定回归
+#
+#  下面几项是实测标定出来的，不是拍脑袋定的。它们很容易
+#  在后续改动中被"顺手调一下"，所以钉死在这里，并说明来历。
+# ============================================================
+
+def test_quality_thresholds_match_measured_scale():
+    """质量分档必须按实测尺度，否则档位形同虚设。
+
+    实测同一说话人 2 秒片段两两余弦：最低 0.485、均值 0.644。
+    所以"好"的门槛不能高于均值，否则人人都是"一般"。
+    """
+    from app.services.users import QUALITY_GOOD, QUALITY_OK
+    assert QUALITY_OK < QUALITY_GOOD
+    assert QUALITY_GOOD <= 0.70, (
+        "实测同人均值才 0.644，门槛高于 0.70 会让正常录入永远评不上'好'")
+    assert QUALITY_OK >= 0.45, (
+        "低于 0.45 会把明显不稳的录入也放行")
+
+
+def test_quality_label_boundaries():
+    from app.services.users import QUALITY_GOOD, QUALITY_OK, quality_label
+    assert quality_label(QUALITY_GOOD) == "好"
+    assert quality_label(QUALITY_GOOD - 1e-6) == "一般"
+    assert quality_label(QUALITY_OK) == "一般"
+    assert quality_label(QUALITY_OK - 1e-6) == "偏差"
+
+
+def test_min_coherence_sits_between_speakers():
+    """拒绝阈值必须落在"同人最低"和"异人最高"之间。
+
+    实测：同人最低 0.485，异人最高 0.360。
+    阈值低于 0.360 拦不住别人；高于 0.485 会误拒本人。
+    """
+    assert 0.36 <= MIN_COHERENCE <= 0.49, (
+        f"MIN_COHERENCE={MIN_COHERENCE} 落在实测的重叠区，"
+        "要么放过旁人，要么误拒本人")
+
+
+def test_verification_window_is_at_least_two_seconds():
+    """声纹判定窗口不能短于 2 秒。
+
+    实测（同人均值 / 异人均值 / 间隔）：
+      0.5s  0.477 / 0.322 / 0.156
+      1.0s  0.582 / 0.372 / 0.210
+      2.0s  0.672 / 0.422 / 0.249
+      3.0s  0.745 / 0.458 / 0.287
+    1 秒时两类分布重叠严重，任何阈值都不好用。
+    """
+    import inspect
+    from app.core.voiceprint import SpeakerVerifier
+    sig = inspect.signature(SpeakerVerifier.__init__)
+    default = sig.parameters["window_sec"].default
+    assert default >= 2.0, f"窗口 {default}s 太短，区分度不够"
+
+
+def test_enrollment_min_speech_is_at_least_two_seconds():
+    """录入单句的最短时长同样不能低于 2 秒（理由同上）。"""
+    assert MIN_SPEECH_SEC >= 2.0, (
+        f"MIN_SPEECH_SEC={MIN_SPEECH_SEC} 太短，抽出的向量会很不稳定")
+
+
+# ============================================================
+#  API 对"用户不存在"的处理
+#
+#  这是实测踩出来的：前端删除用户后，停在旧页面上的标签页
+#  仍会带着已经失效的 id 发请求。所有读接口都必须能优雅降级，
+#  不能变成 500 —— 那会让页面整个卡住，而用户什么都没做错。
+# ============================================================
+
+def test_resolve_user_never_raises(store):
+    """_resolve_user 必须吞掉 UserNotFound。
+
+    各接口对"取不到用户"的处理不同（读接口给空、写接口报错），
+    所以解析函数本身不能抛异常，否则每个调用点都得包一层 try。
+    """
+    from app.api.server import _resolve_user
+    import app.api.server as srv
+
+    orig = srv.user_store
+    srv.user_store = lambda: store
+    try:
+        assert _resolve_user(99999) is None     # 库里没人 → None
+        u = store.create("A")
+        assert _resolve_user(99999).id == u.id  # 有别人 → 回退到最近用的
+        assert _resolve_user(None).id == u.id
+        assert _resolve_user(u.id).id == u.id
+    finally:
+        srv.user_store = orig
+
+
+def test_user_not_found_is_404_not_500(store):
+    """按 id 查/删不存在的用户应当是 404，而不是 500。"""
+    from fastapi import HTTPException
+    import asyncio
+    from app.api.server import get_voiceprint, delete_voiceprint
+    import app.api.server as srv
+
+    orig = srv.user_store
+    srv.user_store = lambda: store
+    try:
+        for coro in (get_voiceprint(99999), delete_voiceprint(99999)):
+            try:
+                asyncio.run(coro)
+                raise AssertionError("应当抛 HTTPException")
+            except HTTPException as e:
+                assert e.status_code == 404, f"应为 404，实际 {e.status_code}"
+    finally:
+        srv.user_store = orig

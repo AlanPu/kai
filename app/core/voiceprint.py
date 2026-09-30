@@ -55,7 +55,7 @@ class SpeakerVerifier:
     """
 
     def __init__(self, model_path: str | Path, prototype: np.ndarray, *,
-                 threshold: float = 0.5, window_sec: float = 1.0,
+                 threshold: float = 0.5, window_sec: float = 2.0,
                  history: int = 3):
         import sherpa_onnx as so
 

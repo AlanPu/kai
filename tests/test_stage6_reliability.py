@@ -164,7 +164,7 @@ def test_usage_survives_json_roundtrip(tmp_path):
 
     db = Database(tmp_path / "u.db")
     db.init_schema()
-    sid = db.create_session("topic", "x")
+    sid = db.create_session(db.create_user("测试用户"), "topic", "x")
     db.finish_session(sid, duration_sec=1800, usage=REAL_USAGE)
     s = db.get_session(sid)
     db.close()

@@ -82,7 +82,7 @@ class ConversationSession:
     """
 
     def __init__(self, settings: Settings, db: Database, *,
-                 session_id: int, instructions: str,
+                 session_id: int, user_id: int, instructions: str,
                  on_client: SendToClient,
                  voiceprint: Optional[SpeakerVerifier] = None,
                  verifier_threshold: float = 0.5,
@@ -93,6 +93,9 @@ class ConversationSession:
         self.s = settings
         self.db = db
         self.session_id = session_id
+        # 画像读写必须知道是谁的 —— 多人共用时写错用户
+        # 会把甲的偏好记到乙头上，且很难发现
+        self.user_id = user_id
         self.instructions = instructions
         self.on_client = on_client
         self.verifier = voiceprint
@@ -425,7 +428,8 @@ class ConversationSession:
         if not facts or self.ended:
             return
         try:
-            n = self.profile_store.absorb(facts, session_id=self.session_id)
+            n = self.profile_store.absorb(self.user_id, facts,
+                                         session_id=self.session_id)
             log.info("画像更新 %d 条: %s", n,
                      ", ".join(f"{f.key}={f.value}" for f in facts[:4]))
             await self.on_client({

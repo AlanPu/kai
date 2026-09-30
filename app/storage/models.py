@@ -18,10 +18,36 @@ SessionStatus = Literal["active", "finished", "aborted"]
 
 
 @dataclass
+class User:
+    """
+    一个练口语的人。
+
+    多人共用一台机器时，声纹、画像、历史都按用户隔离。
+    声纹单独存成文件（data/voiceprints/<id>.json）而不是塞进
+    数据库：它是 192 维浮点数组，放文件里便于直接查看和备份。
+    """
+
+    id: Optional[int] = None
+    name: str = ""
+    avatar: Optional[str] = None            # 单个 emoji，纯显示
+    has_voiceprint: bool = False
+    voiceprint_quality: Optional[float] = None
+    voiceprint_samples: Optional[int] = None
+    created_at: str = ""
+    last_used_at: Optional[str] = None
+
+    def voiceprint_path(self, base_dir) -> "Path":  # noqa: F821
+        """这个用户的声纹文件位置。用 id 命名，避免中文名变成文件名问题。"""
+        from pathlib import Path
+        return Path(base_dir) / f"{self.id}.json"
+
+
+@dataclass
 class Session:
     """一次完整的练习。"""
 
     id: Optional[int] = None
+    user_id: int = 0
     started_at: str = ""
     ended_at: Optional[str] = None
     input_kind: InputKind = "topic"
@@ -86,6 +112,7 @@ class ProfileFact:
     """个人画像中的一条事实。"""
 
     id: Optional[int] = None
+    user_id: int = 0
     category: str = ""
     key: str = ""
     value: str = ""

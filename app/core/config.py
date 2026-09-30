@@ -60,8 +60,12 @@ class Settings:
     session_minutes: int = 30
 
     # ---- 声纹 ----
+    # 多人模式下每个用户一份声纹，存在 voiceprints_dir/<user_id>.json。
+    # voiceprint_path 保留给老的单用户脚本（scripts/ 里还在用），
+    # 应用本身不再读它。
     voiceprint_path: Path = PROJECT_ROOT / "data" / "voiceprint.json"
     voiceprint_model: Path = PROJECT_ROOT / "models" / "campplus.onnx"
+    voiceprints_dir: Path = PROJECT_ROOT / "data" / "voiceprints"
 
     # ---- 数据 ----
     db_path: Path = PROJECT_ROOT / "data" / "app.db"
@@ -111,6 +115,8 @@ def load_settings(env: Optional[dict] = None) -> Settings:
                                  PROJECT_ROOT / "data" / "voiceprint.json"),
         voiceprint_model=get_path("VOICEPRINT_MODEL",
                                   PROJECT_ROOT / "models" / "campplus.onnx"),
+        voiceprints_dir=get_path("VOICEPRINTS_DIR",
+                                 PROJECT_ROOT / "data" / "voiceprints"),
         db_path=get_path("DB_PATH", PROJECT_ROOT / "data" / "app.db"),
         profiles_dir=get_path("PROFILES_DIR",
                               PROJECT_ROOT / "data" / "profiles"),

@@ -153,7 +153,12 @@ def _group_by_category(facts: list[ProfileFact],
 
 
 class ProfileStore:
-    """画像的读写与注入。"""
+    """
+    画像的读写与注入。
+
+    所有方法都需要 user_id：多人共用时，"这是谁的兴趣"必须先确定，
+    否则会把甲的偏好写到乙的画像里，越聊越错。
+    """
 
     def __init__(self, db: Database, profiles_dir: Path):
         self.db = db
@@ -161,26 +166,29 @@ class ProfileStore:
 
     # ---------- 写入 ----------
 
-    def absorb(self, facts: list[ProfileFact],
+    def absorb(self, user_id: int, facts: list[ProfileFact],
                session_id: Optional[int] = None) -> int:
-        """把新抽取的事实并入画像。返回新增/更新的条数。"""
+        """把新抽取的事实并入该用户的画像。返回新增/更新的条数。"""
         if not facts:
             return 0
         for f in facts:
+            f.user_id = user_id
             f.source_session_id = session_id
             self.db.upsert_fact(f)
         return len(facts)
 
     # ---------- 读取 ----------
 
-    def summary(self, min_confidence: float = INJECT_MIN_CONFIDENCE,
+    def summary(self, user_id: int,
+                min_confidence: float = INJECT_MIN_CONFIDENCE,
                 max_facts: int = MAX_INJECT_FACTS) -> str:
         """
-        生成给模型看的画像摘要。
+        生成给模型看的画像摘要（只含该用户的事实）。
 
         按分类组织，只保留置信度够高的，总量有上限。
         """
-        facts = self.db.list_facts(min_confidence=min_confidence)
+        facts = self.db.list_facts(min_confidence=min_confidence,
+                                   user_id=user_id)
         if not facts:
             return ""
 
@@ -202,7 +210,17 @@ class ProfileStore:
                 lines.append(f"- {label}：{'；'.join(items)}")
         return "\n".join(lines)
 
-    def write_markdown(self, path: Optional[Path] = None) -> Path:
+    def markdown_path(self, user_id: int) -> Path:
+        """
+        该用户画像文件的位置。
+
+        每个用户一个文件。用 user_id 命名而不是用户名：
+        用户名可能含 emoji、斜杠或中文，直接当文件名会出问题。
+        """
+        return self.dir / f"{user_id}.md"
+
+    def write_markdown(self, user_id: int,
+                       path: Optional[Path] = None) -> Path:
         """
         导出为 Markdown，供人阅读和手工修改。
 
@@ -210,9 +228,9 @@ class ProfileStore:
         模型记错了，直接改文件即可。
         """
         self.dir.mkdir(parents=True, exist_ok=True)
-        p = path or (self.dir / "profile.md")
+        p = path or self.markdown_path(user_id)
 
-        facts = self.db.list_facts()
+        facts = self.db.list_facts(user_id=user_id)
         by_cat = _group_by_category(facts)
 
         lines = [
@@ -243,15 +261,16 @@ class ProfileStore:
 
     # ---------- 语言问题 ----------
 
-    def language_issues(self, limit: int = 5) -> list[str]:
+    def language_issues(self, user_id: int, limit: int = 5) -> list[str]:
         """
-        从历史纠错中归纳反复出现的问题。
+        从该用户的历史纠错中归纳反复出现的问题。
 
         比单次纠错更有价值 —— "你总是漏冠词" 比
         "这一句漏了 the" 有用得多。
         """
-        words = self.db.top_error_words(limit=limit)
-        facts = [f for f in self.db.list_facts(min_confidence=0.6)
+        words = self.db.top_error_words(limit=limit, user_id=user_id)
+        facts = [f for f in self.db.list_facts(min_confidence=0.6,
+                                               user_id=user_id)
                  if f.category == "language"]
         out = [f"{f.value}" for f in facts[:limit]]
         if words:

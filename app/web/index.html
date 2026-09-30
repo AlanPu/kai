@@ -88,15 +88,52 @@ h1{font-size:19px;margin:0;font-weight:600}
   pointer-events:none;z-index:99;max-width:80vw}
 #toast.show{opacity:1}
 .hint{font-size:12px;color:var(--dim);margin-top:8px}
+
+/* 用户切换：放在标题旁，一眼能看出现在是誰在练 */
+.userchip{display:flex;align-items:center;gap:6px;padding:5px 11px}
+.userchip .vpd{width:7px;height:7px;border-radius:50%;background:#555}
+.userchip .vpd.ok{background:#4ade80}
+.userchip .vpd.no{background:#fbbf24}
+
+.ulist{display:flex;flex-direction:column;gap:8px;margin:14px 0}
+.urow{display:flex;align-items:center;gap:10px;padding:11px 13px;
+  border:1px solid var(--line);border-radius:10px;cursor:pointer;
+  background:transparent}
+.urow:hover{border-color:#555}
+.urow.act{border-color:#4ade80;background:rgba(74,222,128,.07)}
+.urow .nm{font-weight:600}
+.urow .sub{font-size:12px;color:var(--dim)}
+.urow .spacer{flex:1}
+.urow .del{color:#f87171;font-size:12px;padding:3px 7px}
+
+/* 录入向导 */
+.enroll-prog{display:flex;gap:5px;margin:12px 0}
+.enroll-prog i{flex:1;height:5px;border-radius:3px;background:var(--line)}
+.enroll-prog i.done{background:#4ade80}
+.enroll-prog i.now{background:#60a5fa}
+.enroll-say{font-size:19px;line-height:1.55;margin:14px 0;
+  padding:15px;border-radius:10px;background:rgba(255,255,255,.05)}
+.enroll-hint{font-size:12.5px;color:var(--dim)}
+.enroll-status{margin-top:12px;font-size:13px;min-height:20px}
+.enroll-status.bad{color:#fbbf24}
+.enroll-status.good{color:#4ade80}
+.micbar{height:7px;border-radius:4px;background:var(--line);
+  overflow:hidden;margin-top:12px}
+.micbar i{display:block;height:100%;width:0;background:#4ade80;
+  transition:width .08s linear}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>英语口语陪练</h1>
+    <button class="ghost userchip" id="btnUser" title="切换用户">
+      <span id="uAvatar">👤</span>
+      <span id="uName">选择用户</span>
+      <span id="uVp" class="vpd"></span>
+    </button>
     <span class="pill" id="pModel">—</span>
     <span class="pill" id="pVoice">—</span>
-    <span class="pill" id="pVp">—</span>
     <div class="spacer"></div>
     <button class="ghost" id="btnProfile">我的画像</button>
     <button class="ghost" id="btnHistory">历史</button>
@@ -211,6 +248,49 @@ h1{font-size:19px;margin:0;font-weight:600}
   </div>
 </div>
 
+<div id="userModal" class="hidden"
+     style="position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:60;
+            display:flex;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="max-width:460px;width:100%;max-height:85vh;
+       overflow:auto">
+    <h2>谁在练习</h2>
+    <div class="hint">每个用户有各自的声纹、画像和练习记录，互不干扰。</div>
+    <div class="ulist" id="userList"></div>
+    <div class="ctrls">
+      <input id="newUserName" placeholder="新用户的名字" maxlength="24"
+             style="flex:1;min-width:120px">
+      <button id="btnAddUser">添加</button>
+      <div class="spacer"></div>
+      <button class="ghost" id="btnCloseUser">关闭</button>
+    </div>
+    <div class="hint" id="userHint"></div>
+  </div>
+</div>
+
+<div id="enrollModal" class="hidden"
+     style="position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:70;
+            display:flex;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="max-width:520px;width:100%;max-height:88vh;
+       overflow:auto">
+    <h2 id="enrollTitle">录入声纹</h2>
+    <div class="hint" id="enrollIntro">
+      请用平时说话的音量和距离，自然地读出下面这句话。
+      录 3 句以上即可，录得越多越准。
+    </div>
+    <div class="enroll-prog" id="enrollProg"></div>
+    <div class="enroll-say" id="enrollSay">准备中…</div>
+    <div class="enroll-hint" id="enrollHint"></div>
+    <div class="micbar"><i id="enrollMic"></i></div>
+    <div class="enroll-status" id="enrollStatus"></div>
+    <div class="ctrls" style="margin-top:14px">
+      <button id="btnEnrollRec">开始朗读</button>
+      <button class="ghost" id="btnEnrollRedo">重录这句</button>
+      <div class="spacer"></div>
+      <button class="ghost" id="btnEnrollCancel">取消</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -223,12 +303,22 @@ let ctxIn = null, ctxOut = null, playHead = 0;
 let running = false, prepared = null, reportShown = false;
 let lastContent = "", dropped = false, elapsedBefore = 0, reconnects = 0;
 let aborted = false, paused = false;
+let me = null;              // 当前用户
+let enrollWs = null, enrollMic = null, enrollCtx = null,
+    enrollNode = null, enrollRec = false, enrollMeter = 0;
 
 function toast(msg, ms = 2600) {
   const t = $("toast");
   t.textContent = msg; t.classList.add("show");
   clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove("show"), ms);
 }
+// 带用户参数的 URL。多人模式下每个请求都要说明"为谁"，
+// 服务端才能用对声纹和画像。
+function api(url) {
+  if (!me) return url;
+  return url + (url.includes("?") ? "&" : "?") + "user=" + me.id;
+}
+
 function b64ToBytes(b64) {
   const bin = atob(b64), out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
@@ -381,8 +471,6 @@ function onServer(ev) {
   } else if (m.type === "ready") {
     $("pVoice").textContent = m.voice || "语音就绪";
     $("pVoice").className = "pill on";
-    $("pVp").textContent = m.voiceprint ? "声纹已启用" : "声纹关闭";
-    $("pVp").className = "pill " + (m.voiceprint ? "on" : "off");
   } else if (m.type === "user_speaking") {
     $("dAi").classList.remove("live");
     stopPlayback();
@@ -712,7 +800,7 @@ $("btnSkip").onclick = () => {
 $("btnAgain").onclick = () => location.reload();
 
 $("btnProfile").onclick = async () => {
-  const r = await fetch("/api/profile");
+  const r = await fetch(api("/api/profile"));
   const d = await r.json();
   const box = $("profileBody");
   if (!d.count) {
@@ -757,7 +845,7 @@ $("profileModal").onclick = e => {
 
 $("btnHistory").onclick = async () => {
   const [rr, rs] = await Promise.all([
-    fetch("/api/sessions?limit=20"), fetch("/api/stats")]);
+    fetch(api("/api/sessions?limit=20")), fetch(api("/api/stats"))]);
   const d = await rr.json(), st = await rs.json();
   if (!d.sessions || !d.sessions.length) { toast("还没有练习记录"); return; }
   const head = "累计 " + st.finished + " 次练习 · " + st.total_minutes
@@ -771,13 +859,337 @@ $("btnHistory").onclick = async () => {
   alert(head + "\n\n最近的练习：\n\n" + lines.join("\n"));
 };
 
+// ============================================================
+//  用户：切换、新建、删除
+// ============================================================
+
+function renderUserChip() {
+  $("uName").textContent = me ? me.name : "选择用户";
+  $("uAvatar").textContent = me && me.avatar ? me.avatar : "\u{1F464}";
+  const d = $("uVp");
+  d.className = "vpd " + (me && me.has_voiceprint ? "ok" : "no");
+  $("btnUser").title = me
+    ? (me.has_voiceprint
+        ? "声纹质量：" + me.voiceprint_quality_label
+        : "还没有录入声纹，点击录入")
+    : "选择或新建用户";
+}
+
+async function loadUsers() {
+  const r = await fetch("/api/users");
+  const d = await r.json();
+  // 记住上次选的人：刷新页面不该被重置
+  const saved = Number(localStorage.getItem("kai_user") || 0);
+  const found = (d.users || []).find(u => u.id === saved);
+  me = found || d.current || (d.users && d.users[0]) || null;
+  if (me) localStorage.setItem("kai_user", me.id);
+  renderUserChip();
+  renderUserList(d.users || []);
+  return d;
+}
+
+function renderUserList(users) {
+  const box = $("userList");
+  if (!users.length) {
+    box.innerHTML = '<div class="hint">还没有用户，'
+      + '在下面输入名字创建一个吧。</div>';
+    return;
+  }
+  box.innerHTML = users.map(u =>
+    '<div class="urow' + (me && u.id === me.id ? " act" : "")
+    + '" data-id="' + u.id + '">'
+    + '<span style="font-size:19px">'
+    + esc(u.avatar || "\u{1F464}") + '</span>'
+    + '<span><div class="nm">' + esc(u.name) + '</div>'
+    + '<div class="sub">声纹：' + esc(u.voiceprint_quality_label)
+    + (u.has_voiceprint ? " · " + (u.voiceprint_samples || 0) + " 句" : "")
+    + '</div></span><span class="spacer"></span>'
+    + '<button class="ghost del" data-del="' + u.id + '">删除</button>'
+    + '</div>').join("");
+
+  box.querySelectorAll(".urow").forEach(row => {
+    row.onclick = async e => {
+      if (e.target.dataset.del) return;
+      const id = Number(row.dataset.id);
+      const u = users.find(x => x.id === id);
+      if (!u) return;
+      me = u;
+      localStorage.setItem("kai_user", u.id);
+      renderUserChip(); renderUserList(users);
+      $("setupHint").textContent = "";
+      toast("已切换到 " + u.name);
+      // 切换用户后画像/历史都变了，清掉旧的备课结果避免串味
+      if (!running) {
+        $("planCard").classList.add("hidden");
+        prepared = null;
+      }
+      if (!u.has_voiceprint) {
+        $("userHint").innerHTML = '<b>' + esc(u.name)
+          + '</b> 还没有声纹，建议现在录入 — '
+          + '<a href="#" id="linkEnroll">点这里录入</a>';
+        const l = $("linkEnroll");
+        if (l) l.onclick = ev => { ev.preventDefault(); openEnroll(); };
+      } else {
+        $("userHint").textContent = "声纹质量：" + u.voiceprint_quality_label;
+      }
+    };
+  });
+
+  box.querySelectorAll("[data-del]").forEach(b => {
+    b.onclick = async e => {
+      e.stopPropagation();
+      const id = Number(b.dataset.del);
+      const u = users.find(x => x.id === id);
+      if (!u) return;
+      if (!confirm("删除「" + u.name + "」？\n\n"
+        + "他的练习记录、纠错、个人画像和声纹都会一起删除，无法恢复。"))
+        return;
+      const r = await fetch("/api/users/" + id, { method: "DELETE" });
+      if (!r.ok) { toast("删除失败"); return; }
+      const d = await r.json();
+      const st = d.stats || {};
+      toast("已删除：" + (st.sessions || 0) + " 次练习、"
+        + (st.corrections || 0) + " 条纠错、"
+        + (st.facts || 0) + " 条画像");
+      localStorage.removeItem("kai_user");
+      await loadUsers();
+      if (!me) openUserModal();
+    };
+  });
+}
+
+async function addUser() {
+  const name = $("newUserName").value.trim();
+  if (!name) { toast("请输入名字"); return; }
+  const r = await fetch("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name })
+  });
+  const d = await r.json();
+  if (!r.ok) { toast(d.detail || "创建失败"); return; }
+  $("newUserName").value = "";
+  await loadUsers();
+  me = d;
+  localStorage.setItem("kai_user", d.id);
+  renderUserChip();
+  await loadUsers();
+  toast("已创建「" + d.name + "」，接下来录入声纹");
+  openEnroll();
+}
+
+function openUserModal() {
+  $("userModal").classList.remove("hidden");
+  loadUsers();
+}
+
+$("btnUser").onclick = openUserModal;
+$("btnCloseUser").onclick = () => $("userModal").classList.add("hidden");
+$("btnAddUser").onclick = addUser;
+$("newUserName").onkeydown = e => { if (e.key === "Enter") addUser(); };
+$("userModal").onclick = e => {
+  if (e.target === $("userModal")) $("userModal").classList.add("hidden");
+};
+
+// ============================================================
+//  声纹录入：引导跟读
+// ============================================================
+
+let enrollPrompts = [], enrollMin = 3;
+
+async function openEnroll() {
+  if (!me) { toast("先创建一个用户"); openUserModal(); return; }
+  const r = await fetch("/api/enroll/prompts");
+  const d = await r.json();
+  enrollPrompts = d.prompts || [];
+  enrollMin = d.min_samples || 3;
+
+  $("userModal").classList.add("hidden");
+  $("enrollModal").classList.remove("hidden");
+  $("enrollTitle").textContent = "录入声纹 — " + me.name;
+  $("enrollSay").textContent = "准备中…";
+  $("enrollHint").textContent = "";
+  $("enrollStatus").textContent = "";
+  $("enrollStatus").className = "enroll-status";
+  $("enrollProg").innerHTML = "";
+  setEnrollRec(false);
+  connectEnroll();
+}
+
+function setEnrollRec(on) {
+  enrollRec = on;
+  $("btnEnrollRec").textContent = on ? "读完了" : "开始朗读";
+  $("btnEnrollRedo").disabled = !on;
+  if (!on) $("enrollMic").style.width = "0";
+}
+
+function connectEnroll() {
+  if (enrollWs) { try { enrollWs.close(); } catch (e) {} }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  enrollWs = new WebSocket(proto + "://" + location.host
+    + "/ws/enroll?user=" + me.id);
+  enrollWs.binaryType = "arraybuffer";
+
+  enrollWs.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "enroll_start" || m.type === "enroll_progress") {
+      showEnrollProgress(m);
+    } else if (m.type === "enroll_retry") {
+      // 不合格：句子不变，让用户重读
+      $("enrollStatus").textContent = m.reason || "这句没录好，请重读";
+      $("enrollStatus").className = "enroll-status bad";
+      setEnrollRec(false);
+      showEnrollProgress(m);
+    } else if (m.type === "enroll_done") {
+      setEnrollRec(false);
+      stopEnroll();
+      $("enrollStatus").textContent = "录入完成！声纹质量："
+        + m.quality_label + "（" + m.samples + " 句）";
+      $("enrollStatus").className = "enroll-status good";
+      me = m.user;
+      renderUserChip();
+      $("userHint").textContent = "声纹质量：" + m.quality_label;
+      toast("声纹已保存，质量：" + m.quality_label);
+      setTimeout(() => {
+        $("enrollModal").classList.add("hidden");
+        loadUsers();
+      }, 1400);
+    } else if (m.type === "error") {
+      setEnrollRec(false);
+      $("enrollStatus").textContent = m.error || "出错了";
+      $("enrollStatus").className = "enroll-status bad";
+    }
+  };
+  enrollWs.onerror = () => {
+    $("enrollStatus").textContent = "连接失败，请刷新页面重试";
+    $("enrollStatus").className = "enroll-status bad";
+  };
+}
+
+function showEnrollProgress(m) {
+  const total = m.total || enrollPrompts.length || 1;
+  const cur = m.current || 1;
+  let bars = "";
+  for (let i = 0; i < total; i++) {
+    const cls = i < (m.collected || 0) ? "done" : (i === cur - 1 ? "now" : "");
+    bars += '<i class="' + cls + '"></i>';
+  }
+  $("enrollProg").innerHTML = bars;
+  $("enrollSay").textContent = m.prompt || "准备好了";
+  $("enrollHint").textContent = (m.hint ? m.hint + " · " : "")
+    + "第 " + cur + "/" + total + " 句 · 已录 " + (m.collected || 0)
+    + " 句（至少 " + enrollMin + " 句）";
+}
+
+async function startEnrollMic() {
+  if (!enrollMic) {
+    enrollMic = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true,
+               autoGainControl: true, channelCount: 1 }
+    });
+    enrollCtx = new AudioContext({ sampleRate: IN_RATE });
+    const wcode = 'class PCM extends AudioWorkletProcessor {'
+      + 'process(inputs){const ch=inputs[0]&&inputs[0][0];'
+      + 'if(ch&&ch.length)this.port.postMessage(ch.slice(0));return true;}}'
+      + 'registerProcessor("pcm",PCM);';
+    const wurl = URL.createObjectURL(
+      new Blob([wcode], { type: "application/javascript" }));
+    await enrollCtx.audioWorklet.addModule(wurl);
+    URL.revokeObjectURL(wurl);
+
+    enrollNode = new AudioWorkletNode(enrollCtx, "pcm");
+    const src = enrollCtx.createMediaStreamSource(enrollMic);
+    src.connect(enrollNode);
+    // 录入选的采样率就是 IN_RATE，不必再重采样
+    const ratio = enrollCtx.sampleRate / IN_RATE;
+    enrollNode.port.onmessage = e => {
+      let f32 = e.data;
+      if (Math.abs(ratio - 1) > 1e-6) {
+        const n = Math.floor(f32.length / ratio);
+        const out = new Float32Array(n);
+        for (let i = 0; i < n; i++) out[i] = f32[Math.floor(i * ratio)];
+        f32 = out;
+      }
+      // 音量条：让用户知道麦克风真的在工作
+      let sum = 0;
+      for (let i = 0; i < f32.length; i += 8) sum += Math.abs(f32[i]);
+      const lvl = Math.min(100, (sum / (f32.length / 8)) * 320);
+      if (enrollRec) $("enrollMic").style.width = lvl + "%";
+      if (!enrollRec || !enrollWs || enrollWs.readyState !== 1) return;
+      const i16 = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) {
+        const v = Math.max(-1, Math.min(1, f32[i]));
+        i16[i] = v < 0 ? v * 32768 : v * 32767;
+      }
+      enrollWs.send(i16.buffer);
+    };
+  }
+  if (enrollCtx.state === "suspended") await enrollCtx.resume();
+}
+
+function stopEnroll() {
+  enrollRec = false;
+  if (enrollWs) { try { enrollWs.close(); } catch (e) {} enrollWs = null; }
+  if (enrollNode) { try { enrollNode.disconnect(); } catch (e) {} enrollNode = null; }
+  if (enrollMic) {
+    enrollMic.getTracks().forEach(t => t.stop()); enrollMic = null;
+  }
+  if (enrollCtx) { try { enrollCtx.close(); } catch (e) {} enrollCtx = null; }
+}
+
+$("btnEnrollRec").onclick = async () => {
+  if (!enrollWs || enrollWs.readyState !== 1) { connectEnroll(); return; }
+  if (!enrollRec) {
+    try { await startEnrollMic(); }
+    catch (e) {
+      $("enrollStatus").textContent = "拿不到麦克风权限：" + e.message;
+      $("enrollStatus").className = "enroll-status bad";
+      return;
+    }
+    $("enrollStatus").textContent = "正在录音…读完点「读完了」";
+    $("enrollStatus").className = "enroll-status";
+    setEnrollRec(true);
+  } else {
+    setEnrollRec(false);
+    enrollWs.send(JSON.stringify({ type: "end" }));
+  }
+};
+
+$("btnEnrollRedo").onclick = () => {
+  if (!enrollWs || enrollWs.readyState !== 1) return;
+  setEnrollRec(false);
+  enrollWs.send(JSON.stringify({ type: "discard" }));
+  $("enrollStatus").textContent = "已丢弃，重新读这一句";
+  $("enrollStatus").className = "enroll-status";
+};
+
+$("btnEnrollCancel").onclick = () => {
+  if (enrollWs && enrollWs.readyState === 1)
+    enrollWs.send(JSON.stringify({ type: "cancel" }));
+  stopEnroll();
+  $("enrollModal").classList.add("hidden");
+};
+
+$("enrollModal").onclick = e => {
+  if (e.target === $("enrollModal")) $("btnEnrollCancel").onclick();
+};
+
+loadUsers().then(d => {
+  if (!me) {
+    // 第一次使用：直接引导建用户，否则后面每一步都会失败
+    openUserModal();
+    $("userHint").textContent = "先创建一个用户再开始练习。";
+  } else if (!me.has_voiceprint) {
+    $("setupHint").textContent = me.name + " 还没有声纹，"
+      + "练习时无法过滤旁人说话。点左上角用户名可录入。";
+  }
+}).catch(e => console.error("加载用户失败", e));
+
 fetch("/api/health").then(r => r.json()).then(h => {
   $("pModel").textContent = h.model || "—";
   $("pVoice").textContent = h.voice_ready ? "语音就绪" : "缺少语音密钥";
   $("pVoice").className = "pill " + (h.voice_ready ? "on" : "off");
-  $("pVp").textContent = h.voiceprint ? "声纹可用" : "无声纹档案";
-  $("pVp").className = "pill " + (h.voiceprint ? "on" : "off");
-  $("optVp").checked = !!h.voiceprint;
+  $("optVp").checked = !!(me && me.has_voiceprint);
 }).catch(() => {});
 
 window.addEventListener("beforeunload", () => {

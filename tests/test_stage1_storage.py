@@ -20,14 +20,20 @@ def db(tmp_path):
     d.close()
 
 
+@pytest.fixture
+def uid(db):
+    """一个测试用户。会话和画像都必须挂在用户下。"""
+    return db.create_user("测试用户")
+
+
 # ============================================================
 #  验收：完整往返
 # ============================================================
 
-def test_full_session_roundtrip(db):
+def test_full_session_roundtrip(db, uid):
     """写入一次模拟会话，再完整读回。"""
     sid = db.create_session(
-        input_kind="article", input_raw="https://example.com/ai",
+        uid, input_kind="article", input_raw="https://example.com/ai",
         input_title="The Future of AI",
         input_content="Artificial intelligence is transforming...")
     assert sid > 0
@@ -77,9 +83,9 @@ def test_full_session_roundtrip(db):
     assert json.loads(s.usage_json)["tokens"] == 12345
 
 
-def test_auto_sequence_numbering(db):
+def test_auto_sequence_numbering(db, uid):
     """seq 不传时应自动递增。"""
-    sid = db.create_session("topic", "聊天气")
+    sid = db.create_session(uid, "topic", "聊天气")
     for i in range(3):
         db.add_turn(Turn(session_id=sid, role="user", text=f"line {i}"))
     turns = db.list_turns(sid)
@@ -103,15 +109,15 @@ def test_auto_sequence_numbering(db):
     ("vocabulary",    "minor",    True),
     ("vocabulary",    "ignore",   False),
 ])
-def test_should_show_rules(kind, severity, expected):
+def test_should_show_rules(kind, severity, expected, uid):
     """发音的 minor 不展示 —— 避免频繁打断（需求 2 + 需求 4）。"""
     c = Correction(kind=kind, severity=severity)
     assert c.should_show() is expected
 
 
-def test_only_visible_filter(db):
+def test_only_visible_filter(db, uid):
     """只取该展示的纠错时，发音 minor 应被过滤掉。"""
-    sid = db.create_session("topic", "测试")
+    sid = db.create_session(uid, "topic", "测试")
     db.add_correction(Correction(session_id=sid, kind="pronunciation",
                                  severity="critical", original="think",
                                  suggestion="/θɪŋk/", word="think"))
@@ -130,9 +136,9 @@ def test_only_visible_filter(db):
                for c in visible)
 
 
-def test_top_error_words(db):
+def test_top_error_words(db, uid):
     """高频错误单词统计（阶段 5 用）。"""
-    sid = db.create_session("topic", "测试")
+    sid = db.create_session(uid, "topic", "测试")
     for word in ["think", "think", "think", "three", "three", "world"]:
         db.add_correction(Correction(
             session_id=sid, kind="pronunciation", severity="critical",
@@ -147,53 +153,53 @@ def test_top_error_words(db):
 #  需求 6：个人画像
 # ============================================================
 
-def test_profile_upsert_increases_confidence(db):
+def test_profile_upsert_increases_confidence(db, uid):
     """同一事实多次出现 → 置信度上升。"""
-    sid = db.create_session("topic", "聊爱好")
-    f = ProfileFact(category="interest", key="hobby", value="跑步",
+    sid = db.create_session(uid, "topic", "聊爱好")
+    f = ProfileFact(user_id=uid, category="interest", key="hobby", value="跑步",
                     confidence=0.5, source_session_id=sid)
     fid1 = db.upsert_fact(f)
     fid2 = db.upsert_fact(f)
     assert fid1 == fid2, "同一 key 应更新而非新增"
 
-    facts = db.list_facts()
+    facts = db.list_facts(user_id=uid)
     assert len(facts) == 1
     assert facts[0].confidence > 0.5
     assert facts[0].value == "跑步"
 
 
-def test_profile_confidence_capped(db):
+def test_profile_confidence_capped(db, uid):
     """置信度不超过 1.0。"""
     for _ in range(20):
-        db.upsert_fact(ProfileFact(category="interest", key="food",
+        db.upsert_fact(ProfileFact(user_id=uid, category="interest", key="food",
                                    value="火锅", confidence=0.9))
-    facts = db.list_facts()
+    facts = db.list_facts(user_id=uid)
     assert facts[0].confidence <= 1.0
 
 
-def test_profile_min_confidence_filter(db):
+def test_profile_min_confidence_filter(db, uid):
     """画像可按置信度过滤。"""
-    db.upsert_fact(ProfileFact(category="interest", key="a", value="1",
+    db.upsert_fact(ProfileFact(user_id=uid, category="interest", key="a", value="1",
                                confidence=0.2))
-    db.upsert_fact(ProfileFact(category="interest", key="b", value="2",
+    db.upsert_fact(ProfileFact(user_id=uid, category="interest", key="b", value="2",
                                confidence=0.9))
-    assert len(db.list_facts(min_confidence=0.5)) == 1
+    assert len(db.list_facts(min_confidence=0.5, user_id=uid)) == 1
 
 
 # ============================================================
 #  约束与完整性
 # ============================================================
 
-def test_input_kind_constraint(db):
+def test_input_kind_constraint(db, uid):
     """非法输入类型被数据库拒绝。"""
     import sqlite3
     with pytest.raises(sqlite3.IntegrityError):
-        db.create_session("invalid_kind", "x")
+        db.create_session(uid, "invalid_kind", "x")
 
 
-def test_cascade_delete(db):
+def test_cascade_delete(db, uid):
     """删除会话时，轮次和纠错一并删除。"""
-    sid = db.create_session("topic", "x")
+    sid = db.create_session(uid, "topic", "x")
     t = db.add_turn(Turn(session_id=sid, role="user", text="hi"))
     db.add_correction(Correction(session_id=sid, turn_id=t,
                                  original="hi", suggestion="hello"))
@@ -203,8 +209,8 @@ def test_cascade_delete(db):
     assert db.list_corrections(sid) == []
 
 
-def test_list_sessions_ordering(db):
+def test_list_sessions_ordering(db, uid):
     """会话按时间倒序。"""
-    ids = [db.create_session("topic", f"t{i}") for i in range(3)]
+    ids = [db.create_session(uid, "topic", f"t{i}") for i in range(3)]
     got = [s.id for s in db.list_sessions()]
     assert got == list(reversed(ids))

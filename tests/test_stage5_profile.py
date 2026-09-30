@@ -18,8 +18,15 @@ from app.storage.models import ProfileFact
 def store(tmp_path):
     db = Database(tmp_path / "p.db")
     db.init_schema()
+    db.create_user("测试用户")
     yield ProfileStore(db, tmp_path / "profiles"), db
     db.close()
+
+
+@pytest.fixture
+def uid(store):
+    """测试用户 id。画像必须挂在用户下，否则多人会互相覆盖。"""
+    return store[1].list_users()[0].id
 
 
 # ============================================================
@@ -94,83 +101,83 @@ def test_extract_skips_short_text():
 #  累积
 # ============================================================
 
-def test_absorb_and_read(store):
+def test_absorb_and_read(store, uid):
     st, db = store
-    sid = db.create_session("topic", "x")   # 外键要求会话真实存在
-    n = st.absorb([
-        ProfileFact(category="interest", key="hobby", value="跑步",
+    sid = db.create_session(uid, "topic", "x")   # 外键要求会话真实存在
+    n = st.absorb(uid, [
+        ProfileFact(user_id=uid, category="interest", key="hobby", value="跑步",
                     confidence=0.8),
-        ProfileFact(category="background", key="job", value="工程师",
+        ProfileFact(user_id=uid, category="background", key="job", value="工程师",
                     confidence=0.9),
     ], session_id=sid)
     assert n == 2
-    facts = db.list_facts()
+    facts = db.list_facts(user_id=uid)
     assert len(facts) == 2
     assert facts[0].source_session_id == sid
 
 
-def test_absorb_repeated_fact_raises_confidence(store):
+def test_absorb_repeated_fact_raises_confidence(store, uid):
     """同一事实被多次提到 → 更可信（这正是不重复问同样问题的价值）。"""
     st, db = store
-    f = ProfileFact(category="interest", key="hobby", value="跑步",
+    f = ProfileFact(user_id=uid, category="interest", key="hobby", value="跑步",
                     confidence=0.5)
-    st.absorb([f])
-    st.absorb([f])
-    facts = db.list_facts()
+    st.absorb(uid, [f])
+    st.absorb(uid, [f])
+    facts = db.list_facts(user_id=uid)
     assert len(facts) == 1
     assert facts[0].confidence > 0.5
 
 
-def test_absorb_empty_is_noop(store):
+def test_absorb_empty_is_noop(store, uid):
     st, db = store
-    assert st.absorb([]) == 0
-    assert db.list_facts() == []
+    assert st.absorb(uid, []) == 0
+    assert db.list_facts(user_id=uid) == []
 
 
 # ============================================================
 #  注入（需求 6 的核心）
 # ============================================================
 
-def test_summary_empty_when_nothing_known(store):
+def test_summary_empty_when_nothing_known(store, uid):
     st, _ = store
-    assert st.summary() == ""
+    assert st.summary(uid) == ""
 
 
-def test_summary_excludes_low_confidence(store):
+def test_summary_excludes_low_confidence(store, uid):
     """低置信度事实不能注入，否则会误导模型。"""
     st, _ = store
-    st.absorb([
-        ProfileFact(category="interest", key="a", value="确信的",
+    st.absorb(uid, [
+        ProfileFact(user_id=uid, category="interest", key="a", value="确信的",
                     confidence=0.9),
-        ProfileFact(category="interest", key="b", value="不确定的",
+        ProfileFact(user_id=uid, category="interest", key="b", value="不确定的",
                     confidence=0.3),
     ])
-    s = st.summary()
+    s = st.summary(uid)
     assert "确信的" in s
     assert "不确定的" not in s
 
 
-def test_summary_organized_by_category(store):
+def test_summary_organized_by_category(store, uid):
     st, _ = store
-    st.absorb([
-        ProfileFact(category="interest", key="hobby", value="跑步",
+    st.absorb(uid, [
+        ProfileFact(user_id=uid, category="interest", key="hobby", value="跑步",
                     confidence=0.9),
-        ProfileFact(category="goal", key="g", value="想开口流利",
+        ProfileFact(user_id=uid, category="goal", key="g", value="想开口流利",
                     confidence=0.9),
     ])
-    s = st.summary()
+    s = st.summary(uid)
     assert "跑步" in s and "想开口流利" in s
     assert s.count("\n") >= 1, "应按分类分行"
 
 
-def test_summary_respects_max_facts(store):
+def test_summary_respects_max_facts(store, uid):
     """注入总量要有上限，避免提示词无限膨胀。"""
     st, _ = store
-    facts = [ProfileFact(category="interest", key=f"k{i}",
+    facts = [ProfileFact(user_id=uid, category="interest", key=f"k{i}",
                          value=f"v{i}", confidence=0.9)
              for i in range(MAX_INJECT_FACTS + 15)]
-    st.absorb(facts)
-    s = st.summary()
+    st.absorb(uid, facts)
+    s = st.summary(uid)
     assert s.count("；") + s.count("\n") < MAX_INJECT_FACTS + 5
 
 
@@ -182,11 +189,11 @@ def test_summary_threshold_is_reasonable():
 #  Markdown 导出（用户可手工修正）
 # ============================================================
 
-def test_markdown_export(store, tmp_path):
+def test_markdown_export(store, tmp_path, uid):
     st, _ = store
-    st.absorb([ProfileFact(category="interest", key="hobby", value="跑步",
+    st.absorb(uid, [ProfileFact(user_id=uid, category="interest", key="hobby", value="跑步",
                            confidence=0.9)])
-    p = st.write_markdown()
+    p = st.write_markdown(uid)
     text = p.read_text(encoding="utf-8")
     assert "跑步" in text
     assert "画像" in text
@@ -194,9 +201,9 @@ def test_markdown_export(store, tmp_path):
     assert "直接" in text or "修改" in text
 
 
-def test_markdown_export_empty_does_not_crash(store):
+def test_markdown_export_empty_does_not_crash(store, uid):
     st, _ = store
-    p = st.write_markdown()
+    p = st.write_markdown(uid)
     assert p.exists()
 
 
@@ -204,22 +211,22 @@ def test_markdown_export_empty_does_not_crash(store):
 #  语言问题归纳
 # ============================================================
 
-def test_language_issues_from_pronunciation_stats(store):
+def test_language_issues_from_pronunciation_stats(store, uid):
     """高频发音错误应被归纳出来（比单次纠错更有价值）。"""
     st, db = store
-    sid = db.create_session("topic", "x")
+    sid = db.create_session(uid, "topic", "x")
     from app.storage.models import Correction
     for w in ["think", "think", "think", "three"]:
         db.add_correction(Correction(session_id=sid, kind="pronunciation",
                                      severity="critical", original=w,
                                      suggestion="?", word=w))
-    issues = st.language_issues()
+    issues = st.language_issues(uid)
     assert any("think" in i for i in issues)
 
 
-def test_language_issues_empty_when_clean(store):
+def test_language_issues_empty_when_clean(store, uid):
     st, _ = store
-    assert st.language_issues() == []
+    assert st.language_issues(uid) == []
 
 
 # ============================================================

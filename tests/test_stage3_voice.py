@@ -132,6 +132,7 @@ def db(tmp_path):
     from app.storage.db import Database
     d = Database(tmp_path / "t.db")
     d.init_schema()
+    d.create_user("测试用户")     # 会话必须挂在用户下
     yield d
     d.close()
 
@@ -146,9 +147,10 @@ def make_session(db, verifier=None, on_client=None, monkeypatch=None):
         msgs.append(m)
 
     # 必须先建会话行：turns/corrections 有外键约束
-    sid = db.create_session("topic", "test input")
+    uid = db.list_users()[0].id
+    sid = db.create_session(uid, "topic", "test input")
     sess = ConversationSession(
-        settings, db, session_id=sid, instructions="test",
+        settings, db, session_id=sid, user_id=uid, instructions="test",
         on_client=on_client or default_client,
         voiceprint=verifier, minutes=30)
     fake = FakeRT()
