@@ -255,10 +255,16 @@ class ConversationSession:
 
         if self.paused or self.ended or not self.rt:
             return
-        # 用户有动静 → 冷场计时清零。
-        # 注意这里只在"真的送音频上来"时才算：按住空格的模式下
-        # 不按空格前端根本不发数据，所以不会误把静默当活跃。
-        self.touch()
+
+        # ⚠️ 注意：这里**不能**无条件 touch()。
+        #
+        # 踩过的坑：麦克风上行是连续的，即使按住空格模式，松手前后
+        # 也会有零散的静音块到达。如果每块都算"用户有动静"，
+        # 冷场计时就永远被重置，AI 永远等不到"冷场"
+        # ——用户反馈"我停下 20 秒，AI 并没有接上"。
+        #
+        # 所以只有**检测到真实人声**才清零计时。静音和极低音量的
+        # 块只当背景，不算用户说话。
 
         # AI 说话期间不处理输入，避免自我对话
         if self._model_speaking:
@@ -275,6 +281,9 @@ class ConversationSession:
                 self._pending.append(pcm)
                 self._trim_pending()
                 return
+
+            # 确实有人声 → 才算"用户有动静"，冷场计时清零
+            self.touch()
 
             verdict = self.verifier.feed(arr.astype(np.float32))
 
@@ -320,6 +329,15 @@ class ConversationSession:
 
             # 是本人 → 连同待定的音频一起送
             await self._flush_pending()
+
+        else:
+            # 未开启声纹：没有 verifier 帮我们判断人声，
+            # 只能自己按音量判断 —— 否则静音块也会一直重置
+            # 冷场计时，AI 永远等不到"冷场"。
+            arr = np.frombuffer(pcm, dtype=np.int16)
+            if arr.size and rms(arr) <= VOICE_RMS_FLOOR:
+                return                      # 纯静音，不上行也不计时
+            self.touch()
 
         await self._send_audio(pcm)
 

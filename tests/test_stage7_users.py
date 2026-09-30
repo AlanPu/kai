@@ -1208,3 +1208,60 @@ def test_pending_response_guard_expires():
     s.response_pending_timeout = 12.0
     assert s.response_pending() is False, \
         "超时的等待标志必须作废，否则会话永久卡死"
+
+
+def test_silence_does_not_reset_idle_timer():
+    """纯静音不能重置冷场计时。
+
+    这是用户实际反馈的 bug：「我停下了 20 秒，AI 并没有自然接上」。
+
+    原因：push_audio 一进来就无条件 touch()。麦克风上行是连续的，
+    即使按住空格模式，松手前后也会有零散静音块到达 —— 每块都把
+    冷场计时清零，AI 永远等不到"满 20 秒"。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "services" / "session.py").read_text(encoding="utf-8")
+    body = src[src.index("async def push_audio"):]
+    body = body[:body.index("async def _flush_pending")]
+
+    # touch() 必须出现在静音判断之后，不能挂在函数开头
+    rms_at = body.index("VOICE_RMS_FLOOR")
+    touch_at = body.index("self.touch()")
+    assert touch_at > rms_at, \
+        "touch() 必须在判断出『这是人声』之后才调用，否则静音会顶掉冷场计时"
+
+
+def test_silence_is_not_forwarded_without_voiceprint():
+    """未开声纹时，静音块不该上行（否则服务端一直以为用户在说话）。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "services" / "session.py").read_text(encoding="utf-8")
+    body = src[src.index("async def push_audio"):]
+    body = body[:body.index("async def _flush_pending")]
+    assert "else:" in body, "声纹关闭时也要判断音量，不能直接原样上行"
+    assert body.count("return") >= 3, "静音/他人语音等分支都该提前返回"
+
+
+def test_frontend_enables_push_to_talk_gate():
+    """前端必须真的把 push-to-talk 闸门打开。
+
+    实际 bug：`pttActive` 声明了、判定逻辑也写了，但**从来没有人把
+    它置为 true** —— 闸门形同虚设，麦克风一直在上行静音，服务端
+    不断重置冷场计时，AI 永远等不到冷场。
+    """
+    from pathlib import Path
+    import re
+
+    html = (Path(__file__).resolve().parent.parent
+            / "app" / "web" / "index.html").read_text(encoding="utf-8")
+    html = re.sub(r"/\*[\s\S]*?\*/", "", html)
+    html = re.sub(r"//[^\n]*", "", html)
+
+    assert "pttActive = true" in html, \
+        "pttActive 必须被真正置为 true，否则『不按空格不上行』根本没生效"
+    # 置位要发生在麦克风启动流程里（worklet 绑定之前）
+    assert html.index("pttActive = true") < html.index("worklet.port.onmessage"), \
+        "应在启用 worklet 消息处理前就打开闸门"

@@ -487,6 +487,12 @@ async function startMic() {
   URL.revokeObjectURL(url);
 
   worklet = new AudioWorkletNode(ctxIn, "pcm");
+  // 从这里开始启用 push-to-talk 闸门：不按空格一个字节都不上行。
+  // ⚠️ 这个开关必须真的被置上 —— 之前漏了这一行，导致
+  // 闸门形同虚设、麦克风一直在上行静音，服务端把每一块静音都
+  // 当成"用户有动静"从而不断重置冷场计时，AI 永远等不到"冷场"
+  // （用户反馈：停下 20 秒 AI 也不接话）。
+  pttActive = true;
   worklet.port.onmessage = e => {
     if (!running || paused || !ws || ws.readyState !== 1) return;
     // 按住空格才发送：不按的时候完全不采集上行，
