@@ -15,20 +15,26 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from ..core.config import Settings, load_settings
 from ..core.content import load_content
+from ..core.enroll import (DEFAULT_PROMPTS_LIST, MIN_SAMPLES,
+                           EnrollmentSession)
 from ..core.realtime import SessionFatal
-from ..core.voiceprint import SpeakerVerifier, load_voiceprint
+from ..core.voiceprint import SpeakerVerifier
 from ..services.corrector import Corrector
 from ..services.planner import Planner, build_tutor_instructions
 from ..services.cost import estimate_cost, format_usage, parse_realtime_usage
 from ..services.profile import (INJECT_MIN_CONFIDENCE, ProfileExtractor,
                                 ProfileStore)
 from ..services.session import ConversationSession
+from ..services.users import (DuplicateUser, InvalidUser, UserNotFound,
+                              UserStore, quality_label)
 from ..storage.db import Database
 
 log = logging.getLogger(__name__)
@@ -59,12 +65,141 @@ def profile_store() -> ProfileStore:
     return ProfileStore(db(), settings().profiles_dir)
 
 
+def user_store() -> UserStore:
+    return UserStore(db(), settings().voiceprints_dir)
+
+
 def db() -> Database:
     global _db
     if _db is None:
         _db = Database(settings().db_path)
         _db.init_schema()
     return _db
+
+
+# ============================================================
+#  用户：多人共用一台机器
+# ============================================================
+
+class UserIn(BaseModel):
+    name: str
+    avatar: Optional[str] = None
+
+
+def _user_json(u) -> dict:
+    """用户对外表示（含声纹状态），界面直接用。"""
+    return {
+        "id": u.id,
+        "name": u.name,
+        "avatar": u.avatar,
+        "has_voiceprint": u.has_voiceprint,
+        "voiceprint_quality": u.voiceprint_quality,
+        "voiceprint_quality_label": quality_label(u.voiceprint_quality),
+        "voiceprint_samples": u.voiceprint_samples,
+        "created_at": u.created_at,
+        "last_used_at": u.last_used_at,
+    }
+
+
+def _resolve_user(user_id: Optional[int]):
+    """
+    把请求里的 user 参数解析成用户对象。
+
+    没给 user 时回退到「最近用过的那个」：刷新页面、换设备打开时
+    不该突然变成空白，而上次在用的人通常就是现在要用的人。
+
+    取不到就返回 None，由调用方决定怎么办 —— 各接口的处理并不相同
+    （读接口给空结果、写接口报错）。这里**不能抛异常**：
+    用户被删掉后，停在旧页面上的标签页仍会带着失效的 id 发请求，
+    那是正常情况，不该变成 500 把页面整个卡住。
+    """
+    store = user_store()
+    try:
+        if user_id is None:
+            return store.default_user()
+        return store.require(user_id)
+    except UserNotFound:
+        log.info("请求指定的用户 %s 不存在，回退到默认用户", user_id)
+        return store.default_user()
+
+
+@app.get("/api/users")
+async def list_users():
+    """所有用户 + 默认用户（最近使用）。前端据此渲染切换列表。"""
+    store = user_store()
+    users = store.list_users()
+    current = store.default_user()
+    return {
+        "users": [_user_json(u) for u in users],
+        "current": _user_json(current) if current else None,
+    }
+
+
+@app.post("/api/users")
+async def create_user(body: UserIn):
+    try:
+        u = user_store().create(body.name, body.avatar)
+    except DuplicateUser as e:
+        raise HTTPException(409, str(e))
+    except InvalidUser as e:
+        raise HTTPException(400, str(e))
+    return _user_json(u)
+
+
+@app.patch("/api/users/{user_id}")
+async def update_user(user_id: int, body: UserIn):
+    try:
+        u = user_store().rename(user_id, body.name, body.avatar)
+    except UserNotFound as e:
+        raise HTTPException(404, str(e))
+    except DuplicateUser as e:
+        raise HTTPException(409, str(e))
+    except InvalidUser as e:
+        raise HTTPException(400, str(e))
+    return _user_json(u)
+
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: int):
+    """
+    删除用户及其全部数据。
+
+    返回被删掉的统计，让界面能明确说"删了多少东西"——
+    删除不可逆，含糊其辞会让人不敢用或者误删。
+    """
+    try:
+        stats = user_store().delete(user_id)
+    except UserNotFound as e:
+        raise HTTPException(404, str(e))
+    return {"deleted": True, "stats": stats}
+
+
+@app.get("/api/users/{user_id}/voiceprint")
+async def get_voiceprint(user_id: int):
+    try:
+        return user_store().voiceprint_info(user_id)
+    except UserNotFound as e:
+        raise HTTPException(404, str(e))
+
+
+@app.delete("/api/users/{user_id}/voiceprint")
+async def delete_voiceprint(user_id: int):
+    """只清声纹，保留画像和历史 —— 换麦克风想重录的常见场景。"""
+    try:
+        user_store().clear_voiceprint(user_id)
+    except UserNotFound as e:
+        raise HTTPException(404, str(e))
+    return {"cleared": True}
+
+
+@app.get("/api/enroll/prompts")
+async def enroll_prompts():
+    """录入用的跟读句子。放服务端是为了以后能按用户水平调整。"""
+    return {
+        "prompts": [{"text": p.text, "hint": p.hint}
+                    for p in DEFAULT_PROMPTS_LIST],
+        "min_samples": MIN_SAMPLES,
+    }
 
 
 # ============================================================
@@ -85,14 +220,22 @@ async def health():
         "text_ready": s.has_text_credentials(),
         "model": s.qwen_model,
         "session_minutes": s.session_minutes,
-        "voiceprint": s.voiceprint_path.is_file(),
+        # 至少有一个用户录过声纹就算可用（多用户下不再是单个文件）
+        "voiceprint": any(u.has_voiceprint
+                          for u in user_store().list_users()),
     }
 
 
 @app.get("/api/stats")
-async def stats():
-    """累计统计，含总花费估算。"""
-    sessions = db().list_sessions(limit=1000)
+async def stats(user: Optional[int] = None):
+    """某个用户的累计统计，含总花费估算。"""
+    u = _resolve_user(user)
+    if u is None:
+        # 一个用户都没有：返回空统计而不是报错，让首页能正常渲染
+        return {"sessions": 0, "finished": 0, "total_minutes": 0,
+                "total_tokens": 0, "cost_yuan": 0, "user_ratio": 0,
+                "facts_learned": 0, "no_user": True}
+    sessions = db().list_sessions(limit=1000, user_id=u.id)
     total_sec = sum(x.duration_sec or 0 for x in sessions)
     done = [x for x in sessions if x.status == "finished"]
 
@@ -120,7 +263,8 @@ async def stats():
         "total_tokens": tokens,
         "cost_yuan": round(cost, 3),
         "user_ratio": round(user_chars / total_chars, 3) if total_chars else 0,
-        "facts_learned": len(db().list_facts()),
+        "facts_learned": len(db().list_facts(user_id=u.id)),
+        "user_id": u.id,
     }
 
 
@@ -128,16 +272,13 @@ async def stats():
 #  备课：把输入变成话题计划（HTTP，非实时）
 # ============================================================
 
-from pydantic import BaseModel
-
-
 class PrepareIn(BaseModel):
     content: str
     topics: int = 5
 
 
 @app.post("/api/prepare")
-async def prepare(body: PrepareIn):
+async def prepare(body: PrepareIn, user: Optional[int] = None):
     """
     需求 1：输入主题/段落/文章/网址 → 分析内容并预先规划聊什么。
     """
@@ -150,8 +291,9 @@ async def prepare(body: PrepareIn):
         raise HTTPException(400, f"内容无法处理：{content.error}")
 
     # 需求 6：把已知画像注入，让话题更贴近本人
+    u = _resolve_user(user)
     store = profile_store()
-    summary = store.summary()
+    summary = store.summary(u.id) if u else ""
 
     try:
         plan = await asyncio.to_thread(
@@ -173,9 +315,12 @@ async def prepare(body: PrepareIn):
 # ============================================================
 
 @app.get("/api/sessions")
-async def list_sessions(limit: int = 30):
+async def list_sessions(limit: int = 30, user: Optional[int] = None):
+    u = _resolve_user(user)
+    if u is None:
+        return {"sessions": []}
     out = []
-    for s in db().list_sessions(limit=limit):
+    for s in db().list_sessions(limit=limit, user_id=u.id):
         out.append({
             "id": s.id, "started_at": s.started_at, "ended_at": s.ended_at,
             "input_kind": s.input_kind,
@@ -239,27 +384,35 @@ def _build_report(session_id: int) -> Optional[dict]:
 
 
 @app.get("/api/profile")
-async def get_profile():
+async def get_profile(user: Optional[int] = None):
     """已积累的画像，供界面展示与用户检查。"""
+    u = _resolve_user(user)
+    if u is None:
+        return {"count": 0, "facts": [], "summary": "", "issues": [],
+                "no_user": True}
     store = profile_store()
-    facts = db().list_facts()
+    facts = db().list_facts(user_id=u.id)
     return {
+        "user_id": u.id,
         "count": len(facts),
         "facts": [{
             "category": f.category, "key": f.key, "value": f.value,
             "confidence": round(f.confidence, 2),
             "source_session_id": f.source_session_id,
         } for f in facts],
-        "summary": store.summary(min_confidence=INJECT_MIN_CONFIDENCE),
-        "issues": store.language_issues(),
+        "summary": store.summary(u.id, min_confidence=INJECT_MIN_CONFIDENCE),
+        "issues": store.language_issues(u.id),
     }
 
 
 @app.post("/api/profile/export")
-async def export_profile():
+async def export_profile(user: Optional[int] = None):
     """导出为 Markdown，便于人工查看与修正。"""
+    u = _resolve_user(user)
+    if u is None:
+        raise HTTPException(400, "还没有用户，无法导出")
     try:
-        p = profile_store().write_markdown()
+        p = profile_store().write_markdown(u.id)
     except Exception as e:
         raise HTTPException(500, f"导出失败：{e}")
     return {"path": str(p), "text": p.read_text(encoding="utf-8")}
@@ -274,6 +427,7 @@ async def ws_session(ws: WebSocket):
     """
     查询参数：
       content  必填，本次练习的输入内容
+      user  必填，是谁在练（决定用哪份声纹和画像）
       voiceprint  1/0，是否启用声纹过滤（默认 1）
       minutes  本次时长（默认取配置）
     """
@@ -284,6 +438,22 @@ async def ws_session(ws: WebSocket):
         raw_content = ws.query_params.get("content", "").strip()
         if not raw_content:
             await ws.send_json({"type": "error", "error": "缺少 content 参数"})
+            await ws.close()
+            return
+
+        # 用户必须能明确认出来。这里**刻意不做默认回退**：
+        # 认错人的后果是把甲说的话记进乙的历史和画像里，
+        # 而且悄无声息、事后极难发现。宁可报错让前端重新选人。
+        raw_user = ws.query_params.get("user", "").strip()
+        user = None
+        if raw_user:
+            try:
+                user = user_store().get(int(raw_user))
+            except ValueError:
+                user = None
+        if user is None:
+            await ws.send_json({"type": "error",
+                                "error": "用户不存在，请重新选择用户"})
             await ws.close()
             return
 
@@ -313,24 +483,38 @@ async def ws_session(ws: WebSocket):
 
         # ---- 建会话 ----
         sid = db().create_session(
-            content.kind, content.raw,
+            user.id, content.kind, content.raw,
             input_title=content.title, input_content=content.text[:20000])
         db().save_plan(sid, plan.to_dict())
 
-        # ---- 声纹 ----
+        # ---- 声纹（按用户各自的档案）----
         verifier = None
-        if use_vp and s.voiceprint_path.is_file():
-            proto, meta = load_voiceprint(s.voiceprint_path)
+        if use_vp:
+            try:
+                vp = user_store().load_voiceprint(user.id)
+            except Exception as e:
+                vp = None
+                log.warning("读取声纹失败: %s", e)
+            proto = vp[0] if vp else None
+            meta = vp[1] if vp else {}
             if proto is not None and s.voiceprint_model.is_file():
                 try:
                     verifier = await asyncio.to_thread(
                         SpeakerVerifier, s.voiceprint_model, proto)
-                    log.info("声纹已启用 (label=%s)", meta.get("label"))
+                    log.info("声纹已启用 (user=%s %s)", user.name,
+                             meta.get("quality", ""))
                 except Exception as e:
                     log.warning("声纹加载失败，改为不过滤: %s", e)
+            elif use_vp:
+                # 明确告知"这次没过滤"，而不是让人困惑外人说话也有回应
+                await ws.send_json({
+                    "type": "voiceprint_missing",
+                    "message": "这个用户还没有录入声纹，"
+                               "本次不做声纹过滤（旁人说话也会被回应）",
+                })
 
         store = profile_store()
-        summary = store.summary()
+        summary = store.summary(user.id)
         instructions = build_tutor_instructions(
             plan, profile_summary=summary, minutes=minutes)
 
@@ -341,7 +525,8 @@ async def ws_session(ws: WebSocket):
                 pass
 
         sess = ConversationSession(
-            s, db(), session_id=sid, instructions=instructions,
+            s, db(), session_id=sid, user_id=user.id,
+            instructions=instructions,
             on_client=on_client, voiceprint=verifier,
             corrector=Corrector(), profile_store=store,
             profile_extractor=ProfileExtractor(), minutes=minutes)
@@ -508,6 +693,173 @@ async def _timer_loop(ws: WebSocket, sess: ConversationSession) -> None:
         if sess.is_expired():
             await sess.on_client({"type": "time_up"})
             return
+
+
+# ============================================================
+#  声纹录入：引导式跟读
+#
+#  和练习会话分开成两条 WebSocket，因为两件事的节奏完全不同：
+#  录入是"你说一句 → 我当场判断 → 不合格立刻重来"，
+#  而练习是长时间的连续对话。混在一起状态机会乱。
+# ============================================================
+
+def _dummy_prototype() -> np.ndarray:
+    """
+    构造一个占位原型，只为满足 SpeakerVerifier 的构造要求。
+
+    录入阶段只用得到 verifier.ex（特征提取器），不涉及比对，
+    所以原型是什么无所谓 —— 给个合法的单位向量即可。
+    """
+    v = np.zeros(192, dtype=np.float32)
+    v[0] = 1.0
+    return v
+
+
+@app.websocket("/ws/enroll")
+async def ws_enroll(ws: WebSocket):
+    """
+    引导式声纹录入。
+
+    查询参数：
+      user  必填，给谁录
+
+    协议：
+      下行  enroll_start / enroll_progress / enroll_retry
+            / enroll_done / enroll_cancelled / error
+      上行  二进制帧 = 16 kHz int16 PCM
+            {"cmd":"end"|"discard"|"cancel"}
+    """
+    await ws.accept()
+    s = settings()
+
+    # 用户必须明确：录到别人名下会让那个人此后一直认错
+    raw_user = ws.query_params.get("user", "").strip()
+    user = None
+    if raw_user:
+        try:
+            user = user_store().get(int(raw_user))
+        except ValueError:
+            user = None
+    if user is None:
+        await ws.send_json({"type": "error", "error": "用户不存在"})
+        await ws.close()
+        return
+
+    if not s.voiceprint_model.is_file():
+        await ws.send_json({
+            "type": "error",
+            "error": f"声纹模型不存在：{s.voiceprint_model}。"
+                     "请先按 SETUP.md 下载模型。",
+        })
+        await ws.close()
+        return
+
+    # 加载模型可能要几秒，别卡住事件循环
+    try:
+        verifier = await asyncio.to_thread(
+            SpeakerVerifier, s.voiceprint_model, _dummy_prototype(),
+            threshold=0.5)
+    except Exception as e:
+        log.exception("声纹模型加载失败")
+        await ws.send_json({"type": "error", "error": f"声纹模型加载失败：{e}"})
+        await ws.close()
+        return
+
+    sess = EnrollmentSession(user_id=user.id, verifier=verifier)
+    store = user_store()
+    await ws.send_json({"type": "enroll_start", "user": _user_json(user),
+                        **sess.progress()})
+
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                return
+
+            # 音频帧
+            if msg.get("bytes"):
+                # 必须显式按 int16 解释：直接喂 bytes 会被 numpy
+                # 当成 uint8 数组，特征提取器会把它当字符串解析而报错
+                sess.feed(np.frombuffer(msg["bytes"], dtype=np.int16))
+                continue
+
+            raw = msg.get("text")
+            if not raw:
+                continue
+            try:
+                cmd = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            action = (cmd.get("cmd") or "").strip()
+
+            if action == "cancel":
+                await ws.send_json({"type": "enroll_cancelled"})
+                return
+
+            if action == "discard":
+                sess.clear_buffer()
+                await ws.send_json({"type": "enroll_progress",
+                                    **sess.progress()})
+                continue
+
+            if action != "end":
+                continue
+
+            # 判定这一句
+            res = await asyncio.to_thread(sess.commit)
+            if not res.ok:
+                await ws.send_json({"type": "enroll_retry",
+                                    "reason": res.reason,
+                                    **sess.progress()})
+                continue
+
+            if not sess.finished:
+                await ws.send_json({"type": "enroll_progress",
+                                    "speech_sec": round(res.speech_sec, 1),
+                                    **sess.progress()})
+                continue
+
+            # 句子录满了，检查够不够用
+            if not sess.can_save():
+                await ws.send_json({
+                    "type": "enroll_retry",
+                    "reason": f"有效样本不足（至少需要 {MIN_SAMPLES} 句），"
+                              "请再读一遍",
+                    **sess.progress(),
+                })
+                continue
+
+            proto = sess.prototype()
+            if proto is None:
+                await ws.send_json({"type": "enroll_retry",
+                                    "reason": "没有拿到有效声纹，请重新录入",
+                                    **sess.progress()})
+                continue
+
+            quality = float(sess.quality or 0.0)
+            await asyncio.to_thread(
+                store.save_voiceprint, user.id, proto,
+                quality=quality, samples=len(sess.embeddings),
+                raw_embeddings=sess.embeddings)
+
+            fresh = user_store().get(user.id)
+            await ws.send_json({
+                "type": "enroll_done",
+                "user": _user_json(fresh) if fresh else None,
+                "quality": quality,
+                "quality_label": quality_label(quality),
+                "samples": len(sess.embeddings),
+            })
+            return
+
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        log.exception("声纹录入异常")
+        try:
+            await ws.send_json({"type": "error", "error": str(e)})
+        except Exception:
+            pass
 
 
 # ============================================================
