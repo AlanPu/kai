@@ -431,14 +431,34 @@ function stopPlayback() {
 }
 
 // 确保有可用的输出 AudioContext。
-// 浏览器要求音频上下文必须由用户手势创建/恢复，
-// 否则会是 suspended，声音出不来。
+//
+// 浏览器的自动播放策略：AudioContext 必须在**用户手势**里创建或恢复，
+// 否则会一直停在 suspended，所有声音都出不来（用户只看到波形在动）。
+//
+// 这里做了三层保护：
+//   1) 没有/已关闭 → 新建
+//   2) 处于 suspended → resume()
+//   3) 兜底：注册一次性手势监听，用户下次点按/按键时再 resume 一次
+//
+// 第 3 层是关键：resume() 返回 Promise，如果调用时已经脱离手势上下文
+// （比如中间 await 过网络请求），恢复可能被拒绝。挂一个一次性监听
+// 能保证最终一定会被解锁。
 function ensureOutCtx() {
   if (!ctxOut || ctxOut.state === "closed") {
     ctxOut = new AudioContext({ sampleRate: OUT_RATE });
   }
   if (ctxOut.state === "suspended") {
     ctxOut.resume().catch(() => {});
+    // 一次性兜底：任何一个用户手势到达时再试一次
+    const unlock = () => {
+      if (ctxOut && ctxOut.state === "suspended") {
+        ctxOut.resume().catch(() => {});
+      }
+      document.removeEventListener("pointerdown", unlock);
+      document.removeEventListener("keydown", unlock);
+    };
+    document.addEventListener("pointerdown", unlock, { once: true });
+    document.addEventListener("keydown", unlock, { once: true });
   }
   return ctxOut;
 }
@@ -629,6 +649,20 @@ function onServer(ev) {
   } else if (m.type === "audio") {
     $("dAi").classList.add("live");
     enqueueAudio(b64ToBytes(m.pcm));
+    // 一次性诊断：第一次收到音频时把播放链路的真实状态打到控制台。
+    // 用户反馈"听不到 AI 语音"时，靠这段输出就能区分是
+    // 上下文被挂起、还是根本没收到音频、还是数据为空。
+    if (!window.__audioDiag) {
+      window.__audioDiag = true;
+      console.log("[音频诊断] 上下文状态 =", ctxOut ? ctxOut.state : "无",
+                  "| 采样率 =", ctxOut && ctxOut.sampleRate,
+                  "| 播放源 =", playingSources.length,
+                  "| playHead =", playHead.toFixed(3));
+      if (ctxOut && ctxOut.state !== "running") {
+        console.warn("[音频诊断] 音频上下文不是 running，声音不会出来，状态 =",
+                     ctxOut.state);
+      }
+    }
   } else if (m.type === "correction") {
     addCorrection(m);
   } else if (m.type === "profile_learned") {
