@@ -222,8 +222,37 @@ session 结束会显示：
 
 - 模型：**3D-Speaker CAM++**（`models/campplus.onnx`，27MB），192 维声纹特征
 - 推理：**纯 CPU，6~11ms/次**，完全不占用对话延迟
-- 每积累 1 秒音频判一次，**3 次多数表决**，避免单次波动误判
+- 每积累 2 秒音频判一次，**3 次多数表决**，避免单次波动误判
 - **同一台机器上运行**，声纹数据不出本机
+
+#### 模型要自己下载（不随仓库分发）
+
+27MB 的二进制不适合放进 git，需要手动放到位：
+
+```bash
+mkdir -p models
+curl -L -o models/campplus.onnx \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+```
+
+下载后确认大小和校验值：
+
+```bash
+ls -lh models/campplus.onnx        # 应为 28281138 字节
+md5 models/campplus.onnx           # 应为 2ac7673f702e6e45ff45882a4dd55b1a
+```
+
+> 上面这条链接实测可用（2026-09 验证）：下载到的文件与开发时使用的
+> 是**同一个文件**，MD5 完全一致，所以声纹判定阈值可以直接沿用。
+>
+> 不要从 ModelScope 的 `speech_campplus_sv_zh-cn_16k-common` 仓库取 ——
+> 那里只有 PyTorch 的 `campplus_cn_common.bin`，**没有 ONNX**，
+> 按那个路径下载会得到一个 145 字节的 JSON 报错页。
+
+**没下载会怎样**：程序正常启动，但声纹录入会明确报错
+"声纹模型不存在：…/models/campplus.onnx"，练习时则自动跳过声纹过滤
+（并在页面上告知"本次不做声纹过滤"）。不会静默失效。
+相关的两个测试会**跳过**而不是失败 —— 新克隆的人跑测试不该一见红就以为代码坏了。
 
 **已知限制**（诚实说明）：
 
