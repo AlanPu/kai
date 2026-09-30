@@ -31,6 +31,19 @@ h1{font-size:19px;margin:0;font-weight:600}
 .pill.on{color:var(--ok);border-color:#26543c}
 .pill.off{color:var(--err);border-color:#5a2b2b}
 
+/* 按住空格说话：常驻提示 + 按下时的高亮状态 */
+#pttBar{display:none;align-items:center;gap:9px;margin-top:11px;
+  padding:9px 13px;border-radius:10px;font-size:13px;color:var(--dim);
+  background:var(--panel2);border:1px solid var(--line);
+  transition:background .12s,border-color .12s,color .12s}
+#pttBar.show{display:flex}
+#pttBar .key{font-size:12px;padding:2px 9px;border-radius:6px;
+  background:#22262d;border:1px solid #3a4048;color:#c8ccd2;
+  font-family:ui-monospace,Menlo,monospace}
+/* 正在说：整条变绿，让用户一眼看出"它在听" */
+#pttBar.live{background:#14301f;border-color:#2f6b45;color:var(--ok)}
+#pttBar.live .key{background:#1d4a2e;border-color:#3d8a58;color:#c9f5d8}
+
 .cols{display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start}
 @media(max-width:900px){.cols{grid-template-columns:1fr}}
 .card{background:var(--panel);border:1px solid var(--line);
@@ -183,6 +196,11 @@ h1{font-size:19px;margin:0;font-weight:600}
             <div class="spacer"></div>
             <span class="hint" id="duringHint"></span>
           </div>
+          <!-- 按住空格说话：固定显示，避免用户不知道该怎么开口 -->
+          <div id="pttBar">
+            <span class="key">空格</span>
+            <span>按住说话，松开表示说完了</span>
+          </div>
         </div>
       </div>
 
@@ -303,6 +321,11 @@ let ctxIn = null, ctxOut = null, playHead = 0;
 let running = false, prepared = null, reportShown = false;
 let lastContent = "", dropped = false, elapsedBefore = 0, reconnects = 0;
 let aborted = false, paused = false;
+// 按住空格说话（push-to-talk）。
+// holding=true 表示用户此刻正按着空格，麦克风音频才允许上行。
+// 这样服务端不需要靠 VAD 猜"用户说完没有"，回合边界完全由用户控制，
+// 也就不会出现"AI 半天不吭声/突然接上一句并打断我"这类问题。
+let holding = false, pttActive = false;
 let me = null;              // 当前用户
 let enrollWs = null, enrollMic = null, enrollCtx = null,
     enrollNode = null, enrollRec = false, enrollMeter = 0;
@@ -415,6 +438,9 @@ async function startMic() {
   worklet = new AudioWorkletNode(ctxIn, "pcm");
   worklet.port.onmessage = e => {
     if (!running || paused || !ws || ws.readyState !== 1) return;
+    // 按住空格才发送：不按的时候完全不采集上行，
+    // 服务器就永远听不到背景音，也不会误判"用户开始说话"。
+    if (pttActive && !holding) return;
     let f32 = e.data;
     if (Math.abs(ratio - 1) > 1e-6) {
       const n = Math.floor(f32.length / ratio);
@@ -434,6 +460,82 @@ async function startMic() {
   srcNode.connect(worklet);
   // 故意不接 destination，避免把自己的声音放出来形成回授
 }
+
+// ---------- 按住空格说话 ----------
+//
+// 为什么不用 VAD 自动断句：
+// 服务端的 VAD 要自己猜"用户说完没有"，猜错的代价很大 ——
+// 半句话就被当成说完，于是 AI 抢着回应；用户接着说又被当成抢话，
+// 于是 AI 被自己的规则打断。用户的实际感受就是
+// "AI 半天没吭声，然后突然接上一句还把我打断"。
+//
+// 按住空格说话把这个猜测彻底去掉：按下 = 我开始说，
+// 松开 = 我说完了。回合边界由用户掌握，服务端不需要猜。
+//
+// 松开时还要等一小会儿（PTT_TAIL_MS）再让 AI 接话：
+// 麦克风的音频是分块上行、并且带缓冲的，松手瞬间最后
+// 几十毫秒还在路上；立刻断句会把句尾吃掉（听起来像被截断）。
+
+const PTT_TAIL_MS = 250;
+let pttTailTimer = null;
+
+function pttDown() {
+  if (!running || paused || !ws || ws.readyState !== 1) return;
+  if (holding) return;                      // 忽略长按产生的重复 keydown
+  holding = true;
+  if (pttTailTimer) { clearTimeout(pttTailTimer); pttTailTimer = null; }
+  // 用户开口了 → 立刻停掉 AI 的播放，模拟真人被抢话
+  stopPlayback();
+  $("dMic").classList.add("live");
+  $("pttBar").classList.add("live");
+  $("duringHint").textContent = "正在说…（松开空格表示说完了）";
+}
+
+function pttUp() {
+  if (!holding) return;
+  holding = false;
+  $("dMic").classList.remove("live");
+  $("pttBar").classList.remove("live");
+  $("duringHint").textContent = "松开空格 = 说完了，AI 正在听…";
+  // 留一点尾巴，等最后一块音频送出去再断句
+  pttTailTimer = setTimeout(() => {
+    pttTailTimer = null;
+    if (running && !paused && ws && ws.readyState === 1) {
+      // 告诉服务端"这一轮说完了" —— 不再依赖 VAD
+      ws.send(JSON.stringify({ type: "turn_end" }));
+    }
+  }, PTT_TAIL_MS);
+}
+
+// 用 event.code 而不是 event.key：中文输入法/大小写/键盘布局都不会影响，
+// 而且可以顺便忽略长按产生的自动重复（e.repeat）。
+function isSpaceKey(e) {
+  return e.code === "Space" || e.key === " ";
+}
+
+document.addEventListener("keydown", e => {
+  if (!isSpaceKey(e)) return;
+  // 正在输入文字（比如给用户改名）时不要抢空格
+  const el = document.activeElement;
+  if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" ||
+             el.isContentEditable)) return;
+  e.preventDefault();                       // 否则页面会滚动
+  if (e.repeat) return;
+  pttDown();
+});
+
+document.addEventListener("keyup", e => {
+  if (!isSpaceKey(e)) return;
+  const el = document.activeElement;
+  if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" ||
+             el.isContentEditable)) return;
+  e.preventDefault();
+  pttUp();
+});
+
+// 切到别的窗口/标签页时如果还按着空格，keyup 永远收不到，
+// 会导致麦克风一直开着。这里兜底松开。
+window.addEventListener("blur", () => { if (holding) pttUp(); });
 
 function connect(content) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -475,6 +577,9 @@ function onServer(ev) {
   } else if (m.type === "ready") {
     $("pVoice").textContent = m.voice || "语音就绪";
     $("pVoice").className = "pill on";
+    // 会话就绪 → 显示「按住空格说话」提示，否则用户不知道怎么开口
+    $("pttBar").classList.add("show");
+    $("duringHint").textContent = "按住空格开始说";
   } else if (m.type === "user_speaking") {
     $("dAi").classList.remove("live");
     stopPlayback();
@@ -504,6 +609,7 @@ function onServer(ev) {
     toast(m.message || "对话记忆已整理，继续聊。");
   } else if (m.type === "paused") {
     paused = true;
+    if (holding) pttUp();
     elapsedBefore = m.elapsed_sec || 0;
     stopPlayback();
     $("pauseModal").classList.remove("hidden");

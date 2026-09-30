@@ -641,6 +641,12 @@ async def _handle_cmd(cmd: dict, sess: ConversationSession) -> None:
     if t == "cancel":            # 用户抢话
         if sess.rt:
             await sess.rt.cancel_response()
+    elif t == "turn_end":
+        # 「按住空格说话」松开时发来：用户明确表示这一轮说完了。
+        # 有了这个信号就不必再依赖服务端 VAD 猜断句，
+        # 从根上避免"半句话被当成说完 → AI 抢答 → 用户接着说 →
+        # AI 被打断"这一连串问题。
+        await sess.end_turn()
     elif t == "stop":            # 主动结束
         raise _StopRequested()
     elif t == "status":

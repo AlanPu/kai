@@ -52,6 +52,29 @@ def is_recoverable_error(code: str) -> bool:
     return "too many audio" in c or "too_many_audio" in c
 
 
+# 回合竞态：客户端和 VAD 抢着控制回合时的小冲突。
+# 会在正常对话中零星出现，连接完好、下一句就恢复，
+# 所以既不该当致命错误，也不该弹给用户看。
+TURN_RACE_PATTERNS = (
+    "already has an active response",   # 重复 response.create
+    "buffer too small",                 # 空 commit
+    "have no audio",                    # 空 commit 的另一种措辞
+)
+
+
+def is_turn_race_error(message: str) -> bool:
+    """是否是"抢回合"导致的、可自愈的冲突。
+
+    两种实测遇到的形态都源于同一个根因：我们和 VAD 都想控制回合。
+      · VAD 对同一句话会重复报 speech_stopped，
+        于是重复 response.create → "already has an active response"
+      · 服务端在 speech_stopped 时已自行 commit，
+        我们再 commit 一次就是空提交 → "buffer too small"
+    """
+    m = str(message or "").lower()
+    return any(p in m for p in TURN_RACE_PATTERNS)
+
+
 # 额度类错误：重连也不会好，必须如实告诉用户去充值/改计费方式，
 # 而不是让他对着一个永远连不上的会话反复重试。
 QUOTA_CODES = {
@@ -187,8 +210,21 @@ class RealtimeSession:
                 "threshold": self.vad_threshold,
                 "silence_duration_ms": self.silence_ms,
                 "prefix_padding_ms": 300,
-                "create_response": True,
-                "interrupt_response": True,
+                # 关掉服务端的自动回应。
+                #
+                # 实测 create_response=True 在 Qwen 上本来就不生效
+                # （不会自己生成回复），但留着它仍然有害：
+                # 一旦哪天服务端真的开始遵守这个开关，它就会按 VAD
+                # 猜出来的断句点抢答，把用户半句话当成说完。
+                #
+                # 现在断句完全由用户的松手动作决定（push-to-talk，
+                # 见 services/session.py:end_turn），这里必须是 False，
+                # 保证回合只由我们主动发起。
+                "create_response": False,
+                # 用户按住空格说话期间，VAD 的"检测到说话"事件仍然有用
+                # （前端指示灯），但不要让服务端因此打断 AI 的播放 ——
+                # 抢话与否由前端松手/按下时显式 stopPlayback 控制。
+                "interrupt_response": False,
             },
         }
         await self._send({"type": "session.update", "session": cfg})
@@ -211,13 +247,11 @@ class RealtimeSession:
         """打断 AI 当前回复（用户抢话时用）。"""
         await self._send({"type": "response.cancel"})
 
-    async def commit_audio(self) -> None:
-        """提交当前输入音频缓冲。
-
-        必须显式提交，服务端才会把这段音频变成一个 conversation item，
-        之后 response.create 才有内容可回应。
-        """
-        await self._send({"type": "input_audio_buffer.commit"})
+    # 注：曾经有个 commit_audio() 用来自行提交输入缓冲。
+    # 已删除 —— 服务端在 speech_stopped 时会自己 commit，
+    # 我们再做一次就是空提交，服务端会回
+    # "buffer too small, or have no audio"。
+    # 详见 services/session.py 里 _maybe_respond 的注释。
 
     async def request_response(self, instructions: Optional[str] = None) -> None:
         """

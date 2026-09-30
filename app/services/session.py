@@ -22,7 +22,7 @@ from ..core.realtime import (RealtimeSession, SessionFatal, extract_ai_text,
                              is_recoverable_error,
                              extract_audio_delta, extract_transcript,
                              is_fatal_error, is_speech_started,
-                             is_speech_stopped)
+                             is_speech_stopped, is_turn_race_error)
 from ..core.voiceprint import SpeakerVerifier
 from ..storage.db import Database
 from ..storage.models import Correction, Turn
@@ -140,10 +140,13 @@ class ConversationSession:
         self._model_speaking = False
         # 用户当前是否正在说话（由服务端 VAD 的 started/stopped 维护）
         self._user_speaking = False
-        # 上次 commit 之后是否真的送过音频。
-        # commit 空缓冲会让服务端报 invalid_request_error 并打死会话，
-        # 所以要靠这个标志区分「用户真的说了话」和「VAD 误触发」。
-        self._sent_audio_since_commit = False
+        # 是否已经请求过回应但还没等到 response.created。
+        # 用来去重：VAD 对同一句话会重复报 speech_stopped，
+        # 重复发 response.create 会被服务端拒绝
+        # （"Conversation already has an active response"）。
+        self._response_pending = False
+        # 后台小任务的引用集合（触发接话等），避免被 GC 提前回收
+        self._bg_tasks: set[asyncio.Task] = set()
         self._user_buf: list[str] = []
         self._correction_tasks: set[asyncio.Task] = set()
 
@@ -301,10 +304,6 @@ class ConversationSession:
         assert self.rt
         await self.rt.send_audio(pcm)
         self.stats.audio_in_blocks += 1
-        # 记下"自上次 commit 以来确实有音频"，
-        # 供 speech_stopped 判断是否值得 commit（见该处注释）
-        if pcm:
-            self._sent_audio_since_commit = True
 
     # ---------- 事件处理 ----------
 
@@ -314,12 +313,22 @@ class ConversationSession:
         if t == "error":
             err = ev.get("error") or {}
             code = str(err.get("code") or err.get("type") or "")
+            msg = str(err.get("message", "")) + str(code)
+
+            # 先分类，再决定要不要打扰用户。
+            # 原来是一进来就 on_client({"type":"error"})，
+            # 结果连"回合竞态"这种可自愈的小冲突也会弹给用户看，
+            # 让人以为练习出了问题。
+            if is_turn_race_error(msg):
+                log.info("回合竞态（可自愈，已忽略）: %s",
+                         str(err.get("message", ""))[:80])
+                return
+
             await self.on_client({"type": "error", "error": err})
 
             # audio item 超限是可恢复的 —— 重建连接就能继续。
             # 必须先于 is_fatal_error 判断：这个错误的 code 是
             # InvalidParameter，而消息里才带 Too many audios。
-            msg = str(err.get("message", "")) + str(code)
             if is_recoverable_error(msg):
                 # 只置标志，真正的重连由外部循环执行。
                 # 不能在这里直接关连接 —— 会掐断正在跑本回调的
@@ -367,6 +376,10 @@ class ConversationSession:
             # 正确语义：speech_started 意味着「轮到用户」，AI 要闭嘴。
             self._model_speaking = False
             self._user_speaking = True
+            # 用户又开口了 —— 取消「等待回应」的挂起状态。
+            # 否则上一句的 pending 会一直挂着，这一句说完时被误判为重复
+            # 而不再触发接话（表现为"说了新的一句但 AI 没反应"）。
+            self._response_pending = False
             self.stats.user_speech_starts += 1
             await self.on_client({"type": "user_speaking"})
             return
@@ -374,7 +387,7 @@ class ConversationSession:
         if is_speech_stopped(ev):
             # 用户说完一句 —— 该 AI 接话了。
             #
-            # 为什么必须在这里显式触发，而不能靠 turn_detection 的
+            # 为什么必须显式触发，而不能靠 turn_detection 的
             # create_response=True：
             #
             # 实测（Qwen cn-beijing，qwen3.8-omni-flash-realtime）：
@@ -383,33 +396,31 @@ class ConversationSession:
             # 停在那儿等，AI 一直不吭声 —— 必须再说一句"继续"才动。
             # 这正是用户反馈的"不像真人对话"。
             #
-            # 可靠做法是手动两步：先 commit 音频缓冲，再 response.create。
-            # 官方文档里这两个事件都是给客户端手动控制轮流用的；
-            # 只要发了 commit，即便 create_response=True 也不会重复触发。
+            # ⚠️ 这里有两种都会踩坑的写法，都实测过：
             #
-            # 延迟：commit 之后不能立刻 response.create，要等服务端把
-            # 音频 item 落库（实测 0.4~0.6 秒）。发太早会被忽略，
-            # 现象和没修一样 —— 这里踩过。
+            #   1) 手动 input_audio_buffer.commit
+            #      服务端在 speech_stopped 时**已经自己 commit 过了**，
+            #      我们再 commit 一次就是空提交，服务端回：
+            #        "buffer too small, or have no audio"
             #
-            # ⚠️ commit 空缓冲是硬错误，不是无操作：
-            #     "Error committing input audio buffer: buffer too small,
-            #      or have no audio."
-            # 而 code 是 invalid_request_error，在 FATAL_CODES 里，
-            # 会直接把整场会话打死（用户看到「会话被服务端中断」）。
-            # VAD 对一声咳嗽、一次碰麦、键盘声都可能报 speech_stopped，
-            # 所以必须确认真的送过音频才 commit。
+            #   2) 只发 response.create
+            #      实测 AI 不会回应（音频 item 落库尚需时间）
+            #
+            # 现在改用「按住空格说话」：断句由用户的松手动作决定
+            # （见 end_turn）。所以这里**不再**自动触发接话 ——
+            # VAD 的 speech_stopped 只当作参考信息（用于前端指示），
+            # 否则它又会抢在用户真正说完之前把半句话送出去。
             self._user_speaking = False
-            if self._sent_audio_since_commit:
-                self._sent_audio_since_commit = False
-                asyncio.create_task(self._respond_after_turn())
             return
 
         if t == "response.created":
             self._model_speaking = True
+            self._response_pending = False      # 回应已开始，允许下一次触发
             return
 
         if t == "response.done":
             self._model_speaking = False
+            self._response_pending = False
             # AI 说完后清空声纹缓冲，避免把自己的尾音算进判定
             if self.verifier:
                 self.verifier.reset()
@@ -425,19 +436,46 @@ class ConversationSession:
             await self._on_ai_text(ai)
             return
 
-    async def _respond_after_turn(self) -> None:
-        """用户说完后，让 AI 接话。
+    async def end_turn(self) -> None:
+        """用户明确表示「这一轮说完了」（松开空格）。
 
-        顺序很重要：先 commit，等音频 item 真正落库，再 response.create。
-        实测 commit 后立刻 create 会被忽略（服务端还没处理完音频），
-        现象就是"AI 还是不吭声" —— 和没修一模一样。
+        和 VAD 自动断句的区别：这是用户主动给的信号，不需要猜。
+
+        为什么要先 flush：声纹判定未完成时音频会短暂留在 _pending，
+        用户松手时缓冲里可能还有内容。不 flush 就会丢掉句尾几个字。
+        """
+        if self.ended or not self.rt:
+            return
+        await self._flush_pending()
+        self._maybe_respond()
+
+    def _maybe_respond(self) -> None:
+        """触发 AI 接话，并保证一轮只触发一次。
+
+        去重理由：VAD 可能对同一句话重复报 speech_stopped，
+        每次都发 response.create 会撞上
+        "Conversation already has an active response"。
+
+        另外**不要**手动 commit：服务端在 speech_stopped 时已经自己
+        commit 过了，我们再 commit 是空提交，会报 "buffer too small"。
+        """
+        if self._response_pending:
+            return                       # 已经在等回应了，忽略重复触发
+        if self.ended or not self.rt:
+            return
+        self._response_pending = True
+        task = asyncio.create_task(self._respond_after_turn())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _respond_after_turn(self) -> None:
+        """让 AI 接话。只发 response.create，不碰音频缓冲。
+
+        延迟是必要的：speech_stopped 之后服务端还要把音频 item 落库，
+        太早 create 会被忽略（现象就是 AI 不吭声）。0.5 秒实测够用。
         """
         try:
-            await asyncio.sleep(0.05)          # 让 speech_stopped 后续事件先走完
-            if self._model_speaking or self.ended or not self.rt:
-                return                          # 用户又开口了，或会话已结束
-            await self.rt.commit_audio()
-            await asyncio.sleep(0.5)            # 等音频 item 落库
+            await asyncio.sleep(0.5)
             if self._model_speaking or self.ended or not self.rt:
                 return
             await self.rt.request_response()

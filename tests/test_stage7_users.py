@@ -746,35 +746,84 @@ def test_speech_stopped_helper_exists_and_matches_event():
     assert not is_speech_started({"type": "input_audio_buffer.speech_stopped"})
 
 
-def test_session_triggers_response_on_speech_stopped():
-    """用户说完后必须显式触发 AI 回应。
+def test_session_ends_turn_on_explicit_signal():
+    """接话必须由用户显式信号触发，不能靠 VAD 猜断句。
 
-    实测 Qwen 即使 turn_detection.create_response=True，
-    也不会在 speech_stopped 时自动生成回复。所以必须手动
-    commit + response.create，否则表现为"AI 不接话"。
+    历史：这里原本断言「speech_stopped 时要 commit + response.create」。
+    那个设计已被 push-to-talk 取代，原因见下面这段实测记录：
+
+      · VAD 对同一句话会重复报 speech_stopped，于是重复 response.create
+        → "Conversation already has an active response"
+      · 服务端在 speech_stopped 时已自行 commit，我们再 commit 是空提交
+        → "buffer too small, or have no audio"
+      · 最要命的是 VAD 会把半句话当成说完，AI 抢答后用户接着说，
+        AI 又被自己的规则打断 —— 用户感受就是
+        "AI 半天不吭声，然后突然接上一句还把我打断"
+
+    现在回合边界由用户松手决定（end_turn），服务端不再猜。
     """
-    import re
     from pathlib import Path
 
     src = (Path(__file__).resolve().parent.parent
            / "app" / "services" / "session.py").read_text(encoding="utf-8")
-    assert "is_speech_stopped(ev)" in src, "session 没有处理 speech_stopped"
-    assert "_respond_after_turn" in src, "缺少接话逻辑"
-    assert "commit_audio" in src, \
-        "必须先 commit 音频再 response.create，否则服务端会忽略"
+
+    assert "async def end_turn" in src, "缺少 end_turn（用户松手信号）"
+    assert "_maybe_respond" in src, "缺少接话逻辑"
+
+    # speech_stopped 分支里不能再自动接话 —— 否则又回到"猜断句"
+    seg = src[src.index("if is_speech_stopped(ev):"):]
+    seg = seg[:seg.index('if t == "response.created"')]
+    assert "_maybe_respond()" not in seg, \
+        "speech_stopped 不应再自动触发接话（改由 end_turn 触发）"
 
 
-def test_realtime_exposes_commit_audio():
-    """RealtimeSession 要提供 commit_audio。"""
-    from app.core.realtime import RealtimeSession
+def test_end_turn_flushes_pending_before_responding():
+    """松手时要先把缓冲里的音频发完，再让 AI 接话。
 
-    assert hasattr(RealtimeSession, "commit_audio"), "缺少 commit_audio 方法"
+    声纹判定未完成时音频会短暂留在 _pending。按住空格说话时
+    用户可能说得很快，松手瞬间缓冲里还有内容 —— 不 flush 会丢句尾。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "services" / "session.py").read_text(encoding="utf-8")
+    body = src[src.index("async def end_turn"):]
+    body = body[:body.index("def _maybe_respond")]
+    assert "_flush_pending" in body, "end_turn 必须先 flush 缓冲"
+    assert body.index("_flush_pending") < body.index("_maybe_respond"), \
+        "必须先发完音频再触发接话（否则 AI 回应的是半句话）"
+
+
+def test_turn_end_command_is_handled():
+    """前端发来的 turn_end 必须被服务端处理。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "api" / "server.py").read_text(encoding="utf-8")
+    assert '"turn_end"' in src, "服务端没有处理 turn_end 指令"
+    assert "end_turn" in src, "turn_end 没有调用 sess.end_turn"
+
+
+def test_realtime_disables_server_side_auto_response():
+    """必须关掉服务端自动回应，保证回合只由客户端发起。
+
+    create_response=True 在 Qwen 上本来就不生效，但留着有害：
+    服务端一旦开始遵守它，就会按 VAD 猜的断句点抢答。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "core" / "realtime.py").read_text(encoding="utf-8")
+    seg = src[src.index('"turn_detection"'):]
+    seg = seg[:seg.index("}", seg.index("interrupt_response"))]
+    assert '"create_response": False' in seg, \
+        "必须设 create_response=False，否则服务端会自己抢答"
 
 
 def test_respond_after_turn_waits_before_creating_response():
-    """commit 和 response.create 之间必须有等待。
+    """response.create 之前要留一点时间让音频 item 落库。
 
-    实测 commit 后立刻 create 会被服务端忽略，现象和没修一样。
+    实测 speech_stopped 之后立刻 create 会被忽略，现象就是"AI 不吭声"。
     这个测试锁住那个等待，防止有人"优化"掉。
     """
     import re
@@ -784,11 +833,56 @@ def test_respond_after_turn_waits_before_creating_response():
            / "app" / "services" / "session.py").read_text(encoding="utf-8")
     body = src[src.index("async def _respond_after_turn"):]
     body = body[:body.index("async def _on_user_text")]
-    assert "commit_audio" in body and "request_response" in body
+    assert "request_response" in body
     assert re.search(r"await asyncio\.sleep\(0\.[1-9]", body), \
-        "commit 与 response.create 之间缺少等待"
-    assert body.index("commit_audio") < body.index("request_response"), \
-        "必须先 commit 再 request_response"
+        "response.create 之前缺少等待"
+    # 不能再手动 commit：服务端已经自己 commit 过了
+    assert "commit_audio" not in body, \
+        "不应再手动 commit（服务端已自行 commit，重复提交会报 buffer too small"
+
+
+def test_realtime_has_no_commit_audio():
+    """commit_audio 已废弃：服务端在 speech_stopped 时自己 commit。
+
+    我们再做一次就是空提交，服务端回
+    "buffer too small, or have no audio"。
+    """
+    from app.core.realtime import RealtimeSession
+
+    assert not hasattr(RealtimeSession, "commit_audio"), \
+        "commit_audio 应已删除，否则会诱导再次写出空提交"
+
+
+def test_turn_race_errors_are_recognized():
+    """两类回合竞态错误要被识别为可自愈，不能打死会话。
+
+      1) "Conversation already has an active response"
+      2) "buffer too small, or have no audio"
+    """
+    from app.core.realtime import is_turn_race_error
+
+    assert is_turn_race_error(
+        "Error committing input audio buffer: buffer too small, or have no audio")
+    assert is_turn_race_error("Conversation already has an active response")
+    # 真正的 quota 问题不能被误判成竞态
+    assert not is_turn_race_error("insufficient_quota")
+
+
+def test_errors_are_classified_before_notifying_user():
+    """回合竞态不该弹给用户看。
+
+    原来是一收到 error 就先 on_client，连"可自愈的小冲突"也会弹提示，
+    让人以为练习坏了。必须先分类再决定是否通知。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "app" / "services" / "session.py").read_text(encoding="utf-8")
+    seg = src[src.index('if t == "error":'):]
+    seg = seg[:seg.index("if is_fatal_error(code):")]
+    assert "is_turn_race_error(msg)" in seg, "error 分支没有先做竞态分类"
+    assert seg.index("is_turn_race_error") < seg.index('await self.on_client'), \
+        "必须先分类再通知用户，否则会把可自愈的冲突弹给用户看"
 
 
 def test_invalid_request_error_is_not_fatal():
@@ -808,30 +902,3 @@ def test_invalid_request_error_is_not_fatal():
                  "insufficient_quota", "session_expired"):
         assert is_fatal_error(code), f"{code} 应当仍是致命错误"
 
-
-def test_speech_stopped_does_not_commit_without_audio():
-    """没送过音频就不能 commit —— commit 空缓冲会报错。
-
-    实测服务端返回：
-      "Error committing input audio buffer: buffer too small,
-       or have no audio."
-    而 VAD 对咳嗽、碰麦、键盘声都会报 speech_stopped，
-    所以必须靠标志位区分"真的说了话"和"VAD 误触发"。
-    """
-    from pathlib import Path
-
-    src = (Path(__file__).resolve().parent.parent
-           / "app" / "services" / "session.py").read_text(encoding="utf-8")
-    assert "_sent_audio_since_commit" in src, "缺少空缓冲保护标志"
-
-    # 该标志必须在 speech_stopped 分支里被检查
-    seg = src[src.index("if is_speech_stopped(ev):"):]
-    seg = seg[:seg.index("if t == \"response.created\"")]
-    assert "_sent_audio_since_commit" in seg, \
-        "speech_stopped 分支没有检查是否真的送过音频"
-
-    # 送音频时要置位
-    send = src[src.index("async def _send_audio"):]
-    send = send[:send.index("async def _on_qwen_event")]
-    assert "_sent_audio_since_commit = True" in send, \
-        "_send_audio 没有置位标志，保护会永远不生效"
