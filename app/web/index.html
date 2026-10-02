@@ -197,10 +197,12 @@ h1{font-size:19px;margin:0;font-weight:600}
             <div class="spacer"></div>
             <span class="hint" id="duringHint"></span>
           </div>
-          <!-- 按住空格说话：固定显示，避免用户不知道该怎么开口 -->
+          <!-- 快捷键：固定显示，避免用户不知道该怎么开口/求援 -->
           <div id="pttBar">
             <span class="key">空格</span>
             <span>按住说话，松开表示说完了</span>
+            <span class="key">C</span>
+            <span>卡壳时按一下，让 AI 找个话题</span>
           </div>
         </div>
       </div>
@@ -594,12 +596,17 @@ function isSpaceKey(e) {
   return e.code === "Space" || e.key === " ";
 }
 
+// 正在输入文字（比如给用户改名）时不抢快捷键。
+function typingInField() {
+  const el = document.activeElement;
+  return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" ||
+                  el.isContentEditable);
+}
+
 document.addEventListener("keydown", e => {
   if (!isSpaceKey(e)) return;
   // 正在输入文字（比如给用户改名）时不要抢空格
-  const el = document.activeElement;
-  if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" ||
-             el.isContentEditable)) return;
+  if (typingInField()) return;
   e.preventDefault();                       // 否则页面会滚动
   if (e.repeat) return;
   pttDown();
@@ -607,11 +614,34 @@ document.addEventListener("keydown", e => {
 
 document.addEventListener("keyup", e => {
   if (!isSpaceKey(e)) return;
-  const el = document.activeElement;
-  if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" ||
-             el.isContentEditable)) return;
+  if (typingInField()) return;
   e.preventDefault();
   pttUp();
+});
+
+// ---------- 按 C 键请 AI 找话题 ----------
+//
+// 为什么不再是"冷场 15 秒 AI 自动接话"：
+// 自动接话会在用户正组织句子的时候突然开口，把思考时间抢走，
+// 而且用户无法预判它什么时候说话，反而更紧张。
+// 现在改成按 C 键求援 —— 什么时候需要帮忙由用户决定。
+//
+// 用 event.code === "KeyC"，理由同空格：不受输入法/大小写影响。
+function isPromptKey(e) {
+  return e.code === "KeyC" || e.key === "c" || e.key === "C";
+}
+
+document.addEventListener("keydown", e => {
+  if (!isPromptKey(e)) return;
+  if (typingInField()) return;              // 别抢输入框里的 c
+  if (!running || paused || !ws || ws.readyState !== 1) return;
+  if (e.repeat) return;                     // 忽略长按自动重复
+  if (e.metaKey || e.ctrlKey || e.altKey) return;   // ⌘C / Ctrl+C 是复制
+  e.preventDefault();
+  // 按住空格正在说话时按 C 没有意义，忽略掉
+  if (holding) return;
+  ws.send(JSON.stringify({ type: "prompt" }));
+  $("duringHint").textContent = "让 AI 找话题…";
 });
 
 // 切到别的窗口/标签页时如果还按着空格，keyup 永远收不到，
@@ -694,9 +724,9 @@ function onServer(ev) {
       }
     }
   } else if (m.type === "ai_prompted") {
-    // AI 因为冷场主动开口了。轻提示一下，让用户知道
-    // "不是我按错了，是它在等我开口"。
-    $("duringHint").textContent = "等你开口…";
+    // 按 C 键之后 AI 真的开口了。轻提示一下，
+    // 让用户知道"它接上了，不是我按错了"。
+    $("duringHint").textContent = "AI 接话了…";
   } else if (m.type === "correction") {
     addCorrection(m);
   } else if (m.type === "profile_learned") {
@@ -1067,9 +1097,23 @@ $("profileModal").onclick = e => {
 };
 
 $("btnHistory").onclick = async () => {
-  const [rr, rs] = await Promise.all([
-    fetch(api("/api/sessions?limit=20")), fetch(api("/api/stats"))]);
-  const d = await rr.json(), st = await rs.json();
+  // 失败必须说出来。原来这里没有任何 try/catch：只要 stats 挂了，
+  // 整个函数静默抛出，界面表现就是「点了没反应」——
+  // 后端 500 了好几个月都没人发现（踩过）。
+  let d, st;
+  try {
+    const [rr, rs] = await Promise.all([
+      fetch(api("/api/sessions?limit=20")), fetch(api("/api/stats"))]);
+    if (!rr.ok || !rs.ok) {
+      throw new Error("sessions=" + rr.status + " stats=" + rs.status);
+    }
+    d = await rr.json();
+    st = await rs.json();
+  } catch (err) {
+    console.error("[历史] 加载失败", err);
+    toast("读取历史失败：" + (err && err.message ? err.message : err));
+    return;
+  }
   if (!d.sessions || !d.sessions.length) { toast("还没有练习记录"); return; }
   const head = "累计 " + st.finished + " 次练习 · " + st.total_minutes
     + " 分钟 · 约 " + st.cost_yuan.toFixed(2) + " 元 · 记住 "

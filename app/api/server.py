@@ -50,12 +50,6 @@ logging.basicConfig(
 # server.py 在 app/api/ 下，静态页面在 app/web/
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
-# 冷场多久之后 AI 主动找话题 —— 由 .env 的 IDLE_NUDGE_SEC 配置。
-#
-# 这里保留一个模块级常量只是为了兼容旧代码/测试的引用，
-# 实际取值以 Settings 为准（见 _timer_loop）。
-IDLE_NUDGE_SEC = 15.0
-
 # 试听样音说的句子。选一段贴近真实练习场景的英文，
 # 这样听到的效果和实际对话时接近。
 SAMPLE_TEXT = ("Hey! I'm your English speaking partner. "
@@ -799,6 +793,10 @@ async def _handle_cmd(cmd: dict, sess: ConversationSession) -> None:
         # 从根上避免"半句话被当成说完 → AI 抢答 → 用户接着说 →
         # AI 被打断"这一连串问题。
         await sess.end_turn()
+    elif t == "prompt":
+        # 用户按 C 键：卡壳了，请 AI 主动找个话题带一下。
+        # 不再有"冷场 15 秒自动接话"——什么时候需要帮忙由用户决定。
+        await sess.prompt()
     elif t == "stop":            # 主动结束
         raise _StopRequested()
     elif t == "status":
@@ -839,14 +837,10 @@ async def _timer_loop(ws: WebSocket, sess: ConversationSession) -> None:
             log.warning("检测到语音连接已断开，结束会话")
             raise SessionFatal(sess.fatal_error or "connection_closed")
 
-        # 冷场救场：改成「按住空格说话」之后回合完全由用户发起，
-        # 用户不开口 AI 就永远不说话。卡住想不出句子时会一直干等，
-        # 练习就停在那儿了 —— 所以冷场够久就让 AI 主动找话题。
-        # 放在这里（而不是 Qwen 回调里）是因为要发 response.create，
-        # 在回调里做容易和别的事件打架。
-        # 传 None → 由会话自己读 Settings.idle_nudge_sec。
-        # 不再从这里的常量取，避免"改了 .env 却不生效"。
-        await sess.nudge()
+        # 这里不再轮询"冷场够久就让 AI 开口"。
+        # 改成用户按 C 键主动求援（见 _handle_cmd 的 prompt 分支）：
+        # 自动接话会在用户正组织句子的时候抢走思考时间，
+        # 而且用户无法预判它什么时候开口。
 
         snap = sess.snapshot()
         await sess.on_client({

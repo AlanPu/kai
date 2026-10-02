@@ -1073,8 +1073,8 @@ def test_audio_output_context_is_recovered():
 # 所以冷场够久要让 AI 主动找话题。
 
 
-def test_idle_nudge_fires_after_threshold():
-    """冷场超过阈值时，AI 应主动开口。"""
+def test_prompt_fires_on_demand():
+    """用户按 C 键时，AI 应主动开口 —— 与冷场多久无关。"""
     import time as _t
 
     from app.services.session import ConversationSession
@@ -1087,16 +1087,61 @@ def test_idle_nudge_fires_after_threshold():
     s._response_pending = False
     s._nudges_sent = 0
     s._max_nudges = 6
-    s._last_activity = _t.time()
+    s._last_activity = _t.time()          # 刚刚还有动静
 
-    assert s.maybe_nudge(20.0) is None, "刚活动过不该催"
-
-    s._last_activity = _t.time() - 25
-    instr = s.maybe_nudge(20.0)
-    assert instr, "冷场 25 秒应触发主动找话题"
+    # 关键差异：不再看"冷场够不够久"，刚说完话也能立刻求援
+    instr = s.maybe_prompt()
+    assert instr, "按 C 键应立刻触发主动找话题，不该等冷场"
     # 指令要明确禁止"你还在吗"这类扫兴话术
-    assert "silent" in instr.lower()
     assert "still there" in instr.lower()
+
+
+def test_rapid_double_press_only_fires_once():
+    """连按 C 键只能触发一次 —— 走真实的 pending 实现验证。
+
+    为什么用真实方法而不是打桩：第一次验证时把 _mark_response_pending
+    打成了空函数，于是"连按两次"看起来像漏拦，白白追查了一轮。
+    打桩会把要验证的机制本身替换掉，等于没测。
+    """
+    import asyncio
+    import time as _t
+
+    from app.services.session import ConversationSession
+
+    calls = []
+
+    class FakeRT:
+        async def request_response(self, instructions=None):
+            calls.append(instructions)
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.ended = False
+    s.paused = False
+    s.rt = FakeRT()
+    s._model_speaking = False
+    s._response_pending = False
+    s._response_pending_at = 0.0
+    s.response_pending_timeout = 12.0
+    s._nudges_sent = 0
+    s._max_nudges = 6
+    s._last_activity = _t.time()
+    s.on_client = _noop_async
+
+    # 接上真实实现，不打桩
+    for name in ("_mark_response_pending", "_clear_response_pending",
+                 "response_pending"):
+        setattr(s, name,
+                getattr(ConversationSession, name).__get__(s))
+
+    asyncio.run(s.prompt())
+    assert len(calls) == 1, "第一次按 C 键应触发"
+
+    asyncio.run(s.prompt())
+    assert len(calls) == 1, "紧接着再按一次应被拦下，否则 AI 会重复插话"
+
+
+async def _noop_async(*_a, **_k):
+    return None
 
 
 def test_nudge_instruction_forbids_asking_if_still_there():
@@ -1114,8 +1159,8 @@ def test_nudge_instruction_forbids_asking_if_still_there():
     assert later != first, "连续冷场应换策略，而不是重复同一句"
 
 
-def test_nudge_never_interrupts_ai_speech():
-    """AI 正在说话/准备说话时绝不能插嘴。"""
+def test_prompt_never_interrupts_ai_speech():
+    """AI 正在说话/准备说话时按 C 键绝不能插嘴。"""
     import time as _t
 
     from app.services.session import ConversationSession
@@ -1126,18 +1171,18 @@ def test_nudge_never_interrupts_ai_speech():
     s.rt = object()
     s._nudges_sent = 0
     s._max_nudges = 6
-    s._last_activity = _t.time() - 60      # 冷了很久
+    s._last_activity = _t.time()
 
     s._model_speaking = True
-    assert s.maybe_nudge(20.0) is None, "AI 正在说话时不该插嘴"
+    assert s.maybe_prompt() is None, "AI 正在说话时按 C 键不该插嘴"
 
     s._model_speaking = False
     s._response_pending = True
-    assert s.maybe_nudge(20.0) is None, "已在等回应时不该重复触发"
+    assert s.maybe_prompt() is None, "已经在等回应时不该重复触发"
 
 
-def test_nudge_stops_after_max():
-    """催够次数后要停下，不能无限自说自话。"""
+def test_prompt_stops_after_max():
+    """按够次数后要停下，不能一直按着刷屏。"""
     import time as _t
 
     from app.services.session import ConversationSession
@@ -1149,22 +1194,37 @@ def test_nudge_stops_after_max():
     s._model_speaking = False
     s._response_pending = False
     s._max_nudges = 2
+    s._nudges_sent = 0
+    s._last_activity = _t.time()
 
     fired = 0
-    for _ in range(5):
-        s._nudges_sent = 0
-        s._last_activity = _t.time() - 60
-        while s.maybe_nudge(20.0):
-            s._last_activity = _t.time() - 60
-            fired += 1
-            if fired > 10:
-                break
-        break
+    while s.maybe_prompt():
+        fired += 1
+        if fired > 10:
+            break
     assert fired == 2, f"应恰好触发 {2} 次，实际 {fired}"
 
 
-def test_paused_session_never_nudges():
-    """暂停时不该催 —— 用户离开了。"""
+def test_prompt_disabled_when_max_is_zero():
+    """IDLE_NUDGE_MAX=0 时按 C 键应该完全没反应（用来彻底关掉）。"""
+    import time as _t
+
+    from app.services.session import ConversationSession
+
+    s = ConversationSession.__new__(ConversationSession)
+    s.ended = False
+    s.paused = False
+    s.rt = object()
+    s._model_speaking = False
+    s._response_pending = False
+    s._nudges_sent = 0
+    s._max_nudges = 0
+    s._last_activity = _t.time()
+    assert s.maybe_prompt() is None, "上限设为 0 时不该开口"
+
+
+def test_paused_session_never_prompts():
+    """暂停时按 C 键不该有反应 —— 用户离开了。"""
     import time as _t
 
     from app.services.session import ConversationSession
@@ -1177,18 +1237,27 @@ def test_paused_session_never_nudges():
     s._response_pending = False
     s._nudges_sent = 0
     s._max_nudges = 6
-    s._last_activity = _t.time() - 300
-    assert s.maybe_nudge(20.0) is None
+    s._last_activity = _t.time()
+    assert s.maybe_prompt() is None
 
 
-def test_timer_loop_calls_nudge():
-    """冷场救场必须由 _timer_loop 轮询触发。"""
+def test_timer_loop_no_longer_auto_prompts():
+    """冷场自动接话必须已经移除，改由 C 键触发。
+
+    用户明确要求：不要 AI 自己等 15 秒接话，改成按 C 键才触发。
+    如果哪天有人把自动轮询加回来，这条会拦住。
+    """
     from pathlib import Path
 
     src = (Path(__file__).resolve().parent.parent
            / "app" / "api" / "server.py").read_text(encoding="utf-8")
-    assert "IDLE_NUDGE_SEC" in src, "缺少冷场阈值常量"
-    assert "sess.nudge(" in src, "_timer_loop 没有调用 nudge"
+    body = src[src.index("async def _timer_loop"):]
+    body = body[:body.index("# ============================================================")]
+    assert "sess.nudge(" not in body, "_timer_loop 不该再自动触发 AI 找话题"
+    assert "IDLE_NUDGE_SEC" not in src, "冷场阈值已废弃，不该再出现"
+    # 触发入口改成前端发来的 prompt 命令
+    assert '"prompt"' in src, "缺少 C 键对应的 prompt 命令处理"
+    assert "sess.prompt(" in src, "prompt 命令没有调用 sess.prompt"
 
 
 def test_pending_response_guard_expires():
@@ -1268,6 +1337,54 @@ def test_frontend_enables_push_to_talk_gate():
         "应在启用 worklet 消息处理前就打开闸门"
 
 
+def test_history_button_reports_failure():
+    """「历史」按钮失败时必须报错，不能静默。
+
+    真实 bug：/api/stats 因为变量覆盖 500 了，而这里没有 try/catch，
+    Promise.all 一 reject 整个函数就静默抛出 —— 界面表现是
+    「点了没反应」，不是报错。后端挂掉很久都没人察觉。
+    """
+    src = _web_code()
+    body = src[src.index('$("btnHistory").onclick'):]
+    body = body[:body.index("\n};")]
+
+    assert "try" in body and "catch" in body, \
+        "btnHistory 必须捕获失败，否则出错时界面毫无反馈"
+    assert ".ok" in body, \
+        "必须检查 response.ok —— 只 await .json() 会把 500 当成正常响应"
+    assert "toast(" in body, "失败要 toast 告诉用户，而不是只 console.error"
+
+
+def test_frontend_binds_c_key_to_prompt():
+    """前端必须把 C 键接到 prompt 命令上。
+
+    这是"改成按 C 键触发"的入口 —— 服务端已经不再自动接话，
+    前端要是没绑，这个功能就等于没有。
+    """
+    src = _web_code()
+
+    # 用 event.code 判定，不受输入法/大小写影响
+    assert "KeyC" in src, "C 键判定应使用 event.code === 'KeyC'"
+    # 真的把消息发出去
+    assert 'type: "prompt"' in src or 'type:"prompt"' in src, \
+        "按 C 键必须发送 {type: 'prompt'} 给服务端"
+    # 输入框里打字时不能抢 c
+    body = src[src.index("function isPromptKey"):]
+    body = body[:body.index("function connect(")]
+    assert "typingInField" in body, "按 C 键前要判断是否正在输入框里打字"
+    # ⌘C / Ctrl+C 是复制，不能被吞掉
+    assert "metaKey" in body and "ctrlKey" in body, \
+        "必须放过 ⌘C / Ctrl+C，否则用户复制不了东西"
+
+
+def test_frontend_ptt_bar_mentions_c_key():
+    """界面上要有 C 键的说明，否则用户不知道能求援。"""
+    html = _web_html()
+    bar = html[html.index('id="pttBar"'):]
+    bar = bar[:bar.index("</div>", bar.index("卡壳"))]
+    assert ">C<" in bar or "C</span>" in bar, "提示条里要显示 C 键"
+
+
 def test_all_models_come_from_settings():
     """对话/转写/文本三个模型都必须可配置。"""
     import os
@@ -1324,32 +1441,32 @@ def test_startup_prints_active_models():
         assert key in src, f"启动横幅应包含 {key}"
 
 
-def test_idle_threshold_comes_from_config():
-    """冷场阈值必须来自配置，不再由代码写死。
+def test_prompt_signatures_are_key_driven():
+    """触发入口必须是"按了就问"，不再有 threshold 参数。
 
-    用户要求把 15 秒也做成配置项。原先它散落在三处（server.py 的
-    常量 + session.py 两个函数的默认参数），改一处不生效很难查。
-    现在统一为 Settings.idle_nudge_sec，函数默认参数是 None（读配置）。
+    原先是冷场阈值驱动的（maybe_nudge/nudge 带 threshold 默认 None）。
+    改成 C 键之后，触不触发只取决于用户按键，方法上不该再留
+    一个"等够多少秒"的参数 —— 留着迟早有人又接回自动轮询。
     """
     import inspect
 
-    from app.core.config import load_settings
     from app.services.session import ConversationSession
 
-    assert isinstance(load_settings().idle_nudge_sec, float)
+    for fn in (ConversationSession.maybe_prompt,
+               ConversationSession.prompt):
+        params = inspect.signature(fn).parameters
+        assert "threshold" not in params, \
+            f"{fn.__name__} 不该再有 threshold 参数（自动触发已移除）"
 
-    for fn in (ConversationSession.maybe_nudge, ConversationSession.nudge):
-        default = inspect.signature(fn).parameters["threshold"].default
-        assert default is None, \
-            f"{fn.__name__} 的默认参数应为 None（表示读配置），实际 {default}"
+    # 冷场阈值配置项本身也该删干净
+    from app.core.config import load_settings
+    assert not hasattr(load_settings(), "idle_nudge_sec"), \
+        "idle_nudge_sec 已废弃，不该还留在 Settings 里"
 
 
-def test_idle_threshold_is_overridable(monkeypatch):
-    """改环境变量要真的生效。"""
+def test_idle_max_is_overridable(monkeypatch):
+    """IDLE_NUDGE_MAX 改环境变量要真的生效。"""
     import app.core.config as cfg
-
-    monkeypatch.setenv("IDLE_NUDGE_SEC", "7.5")
-    assert cfg.load_settings().idle_nudge_sec == 7.5
 
     monkeypatch.setenv("IDLE_NUDGE_MAX", "3")
     assert cfg.load_settings().idle_nudge_max == 3
@@ -1359,26 +1476,23 @@ def test_bad_idle_config_falls_back(monkeypatch):
     """配置写错不该让服务起不来，退回默认值即可。"""
     import app.core.config as cfg
 
-    for bad in ("abc", "", "-5", "0"):
-        monkeypatch.setenv("IDLE_NUDGE_SEC", bad)
-        assert cfg.load_settings().idle_nudge_sec == 15.0, \
-            f"IDLE_NUDGE_SEC={bad!r} 应退回默认值"
-
-    monkeypatch.setenv("IDLE_NUDGE_MAX", "xyz")
-    assert cfg.load_settings().idle_nudge_max == 6
+    for bad in ("xyz", "", "-5"):
+        monkeypatch.setenv("IDLE_NUDGE_MAX", bad)
+        assert cfg.load_settings().idle_nudge_max == 6, \
+            f"IDLE_NUDGE_MAX={bad!r} 应退回默认值"
 
 
-def test_configured_threshold_actually_gates_nudging(monkeypatch):
-    """配置的秒数要真的决定什么时候开口。"""
+def test_idle_max_actually_gates_prompting(monkeypatch):
+    """配置的次数上限要真的决定按 C 键能问几次。"""
     import time as _t
 
     import app.core.config as cfg
     from app.services.session import ConversationSession
 
-    monkeypatch.setenv("IDLE_NUDGE_SEC", "8")
+    monkeypatch.setenv("IDLE_NUDGE_MAX", "3")
     st = cfg.load_settings()
 
-    def make(idle: float):
+    def make():
         x = ConversationSession.__new__(ConversationSession)
         x.s = st
         x.ended = False
@@ -1388,19 +1502,25 @@ def test_configured_threshold_actually_gates_nudging(monkeypatch):
         x._response_pending = False
         x._nudges_sent = 0
         x._max_nudges = st.idle_nudge_max
-        x._last_activity = _t.time() - idle
+        x._last_activity = _t.time()
         return x
 
-    assert make(9).maybe_nudge(), "冷场 9 秒 > 阈值 8 秒，应触发"
-    assert make(5).maybe_nudge() is None, "冷场 5 秒 < 阈值 8 秒，不该触发"
+    x = make()
+    fired = 0
+    while x.maybe_prompt():
+        fired += 1
+        if fired > 10:
+            break
+    assert fired == 3, f"上限 3 次，实际 {fired}"
 
 
 def test_idle_settings_documented_in_env_example():
-    """.env.example 必须列出这两个配置，否则用户不知道它们存在。"""
+    """.env.example 必须列出这个配置，否则用户不知道它存在。"""
     src = (Path(__file__).resolve().parent.parent
            / ".env.example").read_text(encoding="utf-8")
-    for key in ("IDLE_NUDGE_SEC", "IDLE_NUDGE_MAX"):
-        assert key in src, f"{key} 没写进 .env.example，用户无从得知"
+    assert "IDLE_NUDGE_MAX" in src, "IDLE_NUDGE_MAX 没写进 .env.example"
+    assert "IDLE_NUDGE_SEC" not in src, \
+        "IDLE_NUDGE_SEC 已废弃，不该还留在 .env.example 里"
 
 
 def test_voice_is_configurable(monkeypatch):

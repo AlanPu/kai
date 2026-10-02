@@ -63,15 +63,11 @@ class Settings:
     # ---- 会话 ----
     session_minutes: int = 30
 
-    # 冷场多少秒后让 AI 主动找话题。
+    # 用户按 C 键请 AI 主动找话题时，一轮会话最多响应几次。
     #
-    # 15 秒是权衡的结果：真人对话里这个长度刚好是"对方在等你开口"，
-    # 再长就像冷场，再短就变成催促 —— 用户需要时间组织英文句子，
-    # 催太紧反而说不出来。
-    #
-    # 实际感知的等待会比这个值多最多 5 秒：服务端每 5 秒轮询一次。
-    idle_nudge_sec: float = 15.0
-    # 连续主动找话题的上限，防止 AI 自说自话刷屏。
+    # 为什么需要上限：C 键是手动触发的，但按太多次会让 AI 变成
+    # 一台自说自话的机器，练习反而进行不下去。超过上限后按键
+    # 静默失效，用户仍然可以正常开口说话。
     idle_nudge_max: int = 6
 
     # ---- 声纹 ----
@@ -114,14 +110,8 @@ def load_settings(env: Optional[dict] = None) -> Settings:
     try:
         minutes = int(get("SESSION_MINUTES", "30"))
 
-        # 冷场救场：允许小数（比如 7.5 秒），所以用 float。
-        # 非数字或负数会被丢弃、退回默认值 —— 配置写错不该让服务起不来。
-        try:
-            nudge_sec = float(get("IDLE_NUDGE_SEC", "15"))
-        except ValueError:
-            nudge_sec = 15.0
-        if nudge_sec <= 0:
-            nudge_sec = 15.0
+        # C 键求援的次数上限。配置写错（非数字、负数）不该让服务
+        # 起不来，退回默认值即可。
         try:
             nudge_max = int(get("IDLE_NUDGE_MAX", "6"))
         except ValueError:
@@ -149,7 +139,6 @@ def load_settings(env: Optional[dict] = None) -> Settings:
         voiceprints_dir=get_path("VOICEPRINTS_DIR",
                                  PROJECT_ROOT / "data" / "voiceprints"),
         db_path=get_path("DB_PATH", PROJECT_ROOT / "data" / "app.db"),
-        idle_nudge_sec=nudge_sec,
         idle_nudge_max=nudge_max,
         profiles_dir=get_path("PROFILES_DIR",
                               PROJECT_ROOT / "data" / "profiles"),

@@ -123,14 +123,19 @@ class ConversationSession:
         self.paused_total = 0.0
         self._paused_at: Optional[float] = None
 
-        # 冷场救场：用户长时间不说话时，AI 主动换个角度提问。
+        # 请求 AI 主动找话题：卡壳时用户按 C 键，AI 换个角度提问。
         #
         # 为什么需要：改成「按住空格说话」之后，回合完全由用户发起 ——
         # 用户不开口，AI 就永远不会说话。安静本身没错，但用户
         # 卡住想不出句子时会一直干等，练习就停在那里了。
         #
-        # 阈值和上限都由配置决定（.env 里的 IDLE_NUDGE_SEC /
-        # IDLE_NUDGE_MAX），代码不再替用户拍板。
+        # 为什么不再是「冷场 15 秒自动接话」：那样 AI 会在用户
+        # 正组织句子的时候突然插话，把思考时间抢走；而且用户
+        # 根本没法预判它什么时候开口。改成按键触发之后，
+        # 什么时候需要帮忙完全由用户决定。
+        #
+        # 每轮上限由配置决定（.env 里的 IDLE_NUDGE_MAX），
+        # 代码不替用户拍板。
         self._last_activity = time.time()
         self._nudges_sent = 0
         self._max_nudges = getattr(self.s, "idle_nudge_max", 6)
@@ -790,10 +795,10 @@ class ConversationSession:
         self._response_pending = False
         self._response_pending_at = 0.0
 
-    # ---------- 冷场救场 ----------
+    # ---------- 按 C 键让 AI 找话题 ----------
 
     def touch(self) -> None:
-        """记录"有事发生"，用于判断是否冷场。
+        """记录"有事发生"。
 
         在收到用户音频、用户转写、AI 开始/结束说话时都要调用。
         """
@@ -805,40 +810,40 @@ class ConversationSession:
             return 0.0
         return time.time() - self._last_activity
 
-    def maybe_nudge(self, threshold: Optional[float] = None) -> Optional[str]:
-        """冷场够久了就让 AI 主动找话题。
+    def maybe_prompt(self) -> Optional[str]:
+        """判断此刻能不能让 AI 主动找话题。
 
-        返回要发给模型的提示语；不需要救场时返回 None。
+        返回要发给模型的提示语；不该开口时返回 None。
+
+        这里不判断"冷场够不够久" —— 触不触发完全由用户按 C 键决定。
+        守卫只拦那些"开口就会出问题"的情况：
+        AI 正在说话或已经在等回应时插嘴，会变成自己跟自己抢话。
 
         为什么用 instructions 而不是让 AI 自由发挥：
         直接在 response.create 里带 instructions，可以指定
         "换个角度追问、不要把话题聊死"，否则模型容易重复上一句，
         或者说出"你还在吗？"这种扫兴的话。
         """
-        if threshold is None:
-            threshold = getattr(self.s, "idle_nudge_sec", 15.0)
         if self.ended or self.paused or not self.rt:
             return None
         if self._model_speaking or self.response_pending():
             return None                      # AI 正在说话/准备说话，别插嘴
-        if self.idle_seconds() < threshold:
-            return None
         if self._nudges_sent >= self._max_nudges:
-            return None                      # 已经催够了，剩下的交给用户
+            return None                      # 这一轮问够了，剩下的交给用户
 
         self._nudges_sent += 1
-        self.touch()                         # 重置计时，避免连着催
+        self.touch()
         return self._nudge_instruction()
 
     def _nudge_instruction(self) -> str:
-        """冷场时给模型的指令。
+        """请求 AI 找话题时给模型的指令。
 
         第 1 次温和地换个角度追问；第 2 次起主动引入新话题，
         避免在同一个点上反复打转（那会让冷场更尴尬）。
         """
-        common = ("The user has been silent for a while. "
-                  "Do NOT ask whether they are still there, and do not "
-                  "mention the silence or apologize. ")
+        common = ("The user asked you to help them keep going because they "
+                  "are stuck. Do NOT ask whether they are still there, and do "
+                  "not mention the silence or apologize. ")
         if self._nudges_sent <= 1:
             return (common +
                     "Gently continue the conversation: react to what they "
@@ -849,25 +854,22 @@ class ConversationSession:
                 "about them, and invite them to speak with ONE open question. "
                 "Keep it to one short sentence.")
 
-    async def nudge(self, threshold: Optional[float] = None) -> bool:
-        """冷场时让 AI 主动开口。返回是否真的开口了。
+    async def prompt(self) -> bool:
+        """用户按 C 键：让 AI 主动开口。返回是否真的开口了。
 
-        由 _timer_loop 每 5 秒轮询调用。放在外部循环而不是
-        Qwen 的事件回调里，是因为要发 response.create ——
-        在回调里做容易和别的事件打架。
+        由前端的 prompt 命令调用。回合完全由用户发起
+        （按住空格说话），所以卡壳时得有个求援的入口。
         """
-        # 先记下冷场时长：maybe_nudge 内部会 touch() 重置计时，
-        # 晚了就读到 0（踩过）。
         idle = self.idle_seconds()
-        instr = self.maybe_nudge(threshold)
+        instr = self.maybe_prompt()
         if not instr:
             return False
         try:
             self._mark_response_pending()
             await self.rt.request_response(instructions=instr)
             await self.on_client({"type": "ai_prompted", "idle_sec": int(idle)})
-            log.info("冷场 %.0f 秒，AI 主动找话题（第 %d 次）",
-                     idle, self._nudges_sent)
+            log.info("用户按 C 键，AI 主动找话题（第 %d 次，已静默 %.0f 秒）",
+                     self._nudges_sent, idle)
             return True
         except Exception as e:                   # noqa: BLE001
             self._clear_response_pending()
