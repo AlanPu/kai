@@ -516,6 +516,61 @@ def test_stats_has_speech_start_counter():
     assert SessionStats().user_speech_starts == 0
 
 
+def test_stats_endpoint_survives_usage_rows(tmp_path, monkeypatch):
+    """/api/stats 有 usage 记录时不能 500。
+
+    真实 bug：「历史」按钮打不开，点了一点反应都没有。
+    根因是循环里用 `u = parse_realtime_usage(...)` 把上面那个
+    用户对象 `u` 覆盖掉了，末尾 `u.id` 变成读 Usage 对象的属性
+    → AttributeError → 整个接口 500。
+
+    为什么一直没被发现：前端 `Promise.all` 里 stats 一挂，
+    两个请求一起 reject，函数直接抛出，连 toast 都没有 ——
+    界面表现为「按钮没反应」，而不是报错。
+
+    这里必须**真的带上 usage_json**，否则循环体走不到那行，
+    覆盖就不会发生，测试会假通过。
+    """
+    import asyncio
+
+    from app.api import server as srv
+    from app.core.config import Settings
+    from app.storage.db import Database
+
+    db = Database(tmp_path / "t.db")
+    db.init_schema()
+    uid = db.create_user("测试用户")
+    sid = db.create_session(uid, "topic", "weekend plans")
+
+    # 关键：写入一条带用量的 finished 记录，把循环体喂进去
+    db.finish_session(sid, usage={"response": {"usage": {"total_tokens": 1234}}})
+
+    monkeypatch.setattr(srv, "_db", db)
+    monkeypatch.setattr(srv, "settings", lambda: Settings(db_path=tmp_path / "t.db"))
+    monkeypatch.setattr(srv, "user_store", lambda: _FakeUserStore(uid))
+
+    out = asyncio.run(srv.stats(user=uid))
+
+    assert out["user_id"] == uid, "返回的必须是用户 id，不是 Usage 对象"
+    assert out["facts_learned"] == 0
+    assert out["finished"] == 1
+
+
+class _FakeUserStore:
+    """只实现 stats 用得到的那一个方法，避免依赖真实用户目录。"""
+
+    def __init__(self, uid):
+        self._uid = uid
+
+    def require(self, uid):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=self._uid)
+
+    def default_user(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=self._uid)
+
+
 # ============================================================
 #  上下文轮转（Qwen 的 320 条 audio item 上限）
 # ============================================================

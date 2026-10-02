@@ -395,9 +395,12 @@ async def stats(user: Optional[int] = None):
             continue
         try:
             import json as _json
-            u = parse_realtime_usage(_json.loads(x.usage_json))
-            tokens += u.total_tokens
-            cost += estimate_cost(u)
+            # ⚠️ 变量名不能叫 u —— 上面那个 u 是用户对象，
+            # 被循环覆盖后下面的 u.id 会变成 Usage 对象的属性，
+            # 整个 /api/stats 直接 500（「历史」按钮因此打不开）。
+            usage = parse_realtime_usage(_json.loads(x.usage_json))
+            tokens += usage.total_tokens
+            cost += estimate_cost(usage)
         except Exception:
             continue
 
