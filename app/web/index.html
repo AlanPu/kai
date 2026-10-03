@@ -412,8 +412,17 @@ function addCorrection(c) {
   const box = $("corrections");
   const h = box.querySelector(".hint");
   if (h) h.remove();
+  // 新卡片追加在容器底部（见 renderCorr），所以"跟随最新"就是滚到底部。
+  //
+  // ⚠️ 必须在 renderCorr **之前**测量：插入新节点会立刻把 scrollHeight
+  // 撑大，之后再测就永远算不出"用户原本是否贴着底部"。
+  //
+  // 只有用户本来就停在底部附近才跟随；用户主动往上翻看历史纠错时
+  // 不打扰他 —— 否则每来一条新纠错都会把他拽回底部。
+  // 24px 是容忍亚像素布局与末尾间距的阈值。
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
   renderCorr(c, box);
-  box.scrollTop = 0;
+  if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
 function enqueueAudio(bytes) {
