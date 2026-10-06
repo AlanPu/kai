@@ -255,6 +255,28 @@ h1{font-size:19px;margin:0;font-weight:600}
   </div>
 </div>
 
+<!-- 结束练习的确认框。
+     为什么不用原生 confirm()：
+     原生对话框是阻塞式的、且由系统进程绘制，点击它的按钮时
+     mousedown 就会让对话框消失，随后的 mouseup/click 由页面
+     重新做命中测试 —— 解算结果取决于鼠标落点。于是出现"只有某些
+     区域点得中、点了确定却只是关掉对话框、对话没结束"。
+     这里改成页内自己的模态框：点击语义完全在我们手里，
+     「确定」是唯一确定的入口。 -->
+<div id="confirmModal" class="hidden"
+  style="position:fixed;inset:0;background:rgba(8,10,14,.92);z-index:120;
+  display:flex;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="max-width:420px;width:100%;text-align:center">
+    <h2 id="confirmTitle" style="margin-top:0">确定结束本次练习？</h2>
+    <p class="hint" id="confirmHint" style="font-size:13px">
+      结束时会生成报告，刚才聊过的内容都会保存。</p>
+    <div class="ctrls" style="margin-top:18px;justify-content:center">
+      <button class="ghost" id="btnConfirmCancel">取消</button>
+      <button id="btnConfirmOk">确定结束</button>
+    </div>
+  </div>
+</div>
+
 <div id="profileModal" class="hidden"
   style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;
   display:flex;align-items:center;justify-content:center;padding:20px">
@@ -1027,10 +1049,72 @@ $("btnReprepare").onclick = () => {
   $("input").focus();
 };
 
-$("btnStop").onclick = () => {
-  if (!confirm("确定结束本次练习？")) return;
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "stop" }));
-  else showReport(null);
+// 通用确认框。返回 Promise<boolean>，由调用方决定确认后做什么。
+// 注意：这里刻意不使用原生 confirm() —— 理由见 #confirmModal 的注释。
+// 原生对话框会阻塞事件循环，且它的点击会导致页面重新做命中测试，
+// 表现为"只有某些区域点得中、点了确定却没结束对话"。
+function askConfirm(opts) {
+  const box = $("confirmModal");
+  const t = opts && opts.title || "确定吗？";
+  const h = opts && opts.hint || "";
+  const okText = opts && opts.okText || "确定";
+  $("confirmTitle").textContent = t;
+  $("confirmHint").textContent = h;
+  $("confirmHint").style.display = h ? "" : "none";
+  $("btnConfirmOk").textContent = okText;
+
+  return new Promise(resolve => {
+    // 防重入：连点「确定」也只会 resolve 一次。
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      box.classList.add("hidden");
+      document.removeEventListener("keydown", onKey, true);
+      resolve(v);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); done(false); }
+      else if (e.key === "Enter") { e.preventDefault(); done(true); }
+    };
+
+    $("btnConfirmOk").onclick = () => done(true);
+    $("btnConfirmCancel").onclick = () => done(false);
+    // 点遮罩空白处 = 取消。放在 capture 阶段并停掉冒泡，
+    // 免得点空隙时事件继续传到下层页面触发别的按钮。
+    box.onclick = (e) => { if (e.target === box) done(false); };
+    document.addEventListener("keydown", onKey, true);
+
+    box.classList.remove("hidden");
+    $("btnConfirmOk").focus();
+  });
+}
+
+// 结束练习：确认 → 让服务端走正常收尾（存库 + 生成报告）。
+$("btnStop").onclick = async () => {
+  // 已经在收尾或已经出报告时，按钮不该再有反应，
+  // 否则会重复发 stop、把已经拿到的报告又冲掉一次。
+  if (reportShown) return;
+  const ok = await askConfirm({
+    title: "确定结束本次练习？",
+    hint: "结束时会生成报告，刚才聊过的内容都会保存。",
+    okText: "确定结束",
+  });
+  if (!ok) return;
+  if (holding) pttUp();
+  if (ws && ws.readyState === 1) {
+    // 用 toast 而不是 duringHint 提示"正在收尾"：
+    // ① duringHint 只有 12px 灰色小字，在深色底上几乎看不见，
+    //    而收尾可能要等好几秒（关语音连接实测会超时），
+    //    用户这段时间必须有明显反馈才不会再点；
+    // ② duringHint 是共用字段，会被"按住空格开始说""AI 接话了"
+    //    等消息随时覆盖，写在这里等于随时可能被冲掉。
+    toast("正在结束并生成报告…", 6000);
+    ws.send(JSON.stringify({ type: "stop" }));
+  } else {
+    // 连接已经不在了，走本地记录兜底。
+    finishNow();
+  }
 };
 
 function doPause() {
@@ -1217,9 +1301,14 @@ function renderUserList(users) {
       const id = Number(b.dataset.del);
       const u = users.find(x => x.id === id);
       if (!u) return;
-      if (!confirm("删除「" + u.name + "」？\n\n"
-        + "他的练习记录、纠错、个人画像和声纹都会一起删除，无法恢复。"))
-        return;
+      // 同样不用原生 confirm()：删除是不可恢复的操作，
+      // 一次"只关掉对话框没真删"的误判比不弹框更危险。
+      const ok = await askConfirm({
+        title: "删除「" + u.name + "」？",
+        hint: "他的练习记录、纠错、个人画像和声纹都会一起删除，无法恢复。",
+        okText: "删除",
+      });
+      if (!ok) return;
       const r = await fetch("/api/users/" + id, { method: "DELETE" });
       if (!r.ok) { toast("删除失败"); return; }
       const d = await r.json();
