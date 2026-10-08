@@ -712,7 +712,10 @@ function onServer(ev) {
   } else if (m.type === "plan") {
     prepared = m.plan;
     renderPlan();
-    $("duringHint").textContent = "";
+    // reused=true 表示用的是刚才预览的那一份，没重新想。
+    // 说清楚是有意为之：这样用户能确认"我看到的和听到的是同一批话题"。
+    $("duringHint").textContent = m.reused
+      ? "沿用刚才生成的话题" : "";
   } else if (m.type === "session") {
     running = true;
     $("pTime").textContent = fmt(m.minutes * 60);
@@ -991,10 +994,17 @@ function showReport(r) {
 $("btnPrepare").onclick = async () => {
   const content = ($("input").value || "").trim();
   if (!content) { toast("请先输入内容"); return; }
+  // 备课要按当前选中的人来，不带 user 服务端不知道是谁，
+  // 会拿"最近用过的那个人"的背景来设计话题。
+  if (!me) {
+    toast("请先选择或创建一个用户");
+    openUserModal();
+    return;
+  }
   $("btnPrepare").disabled = true;
   $("setupHint").textContent = "分析中…";
   try {
-    const r = await fetch("/api/prepare", {
+    const r = await fetch(api("/api/prepare"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: content, topics: 5 })
@@ -1004,8 +1014,12 @@ $("btnPrepare").onclick = async () => {
     prepared = d.plan;
     renderPlan();
     $("planCard").classList.remove("hidden");
-    $("setupHint").textContent = d.kind === "url"
-      ? "已抓取网页正文（" + d.chars + " 字符）" : "";
+    // 明确告诉用户这份话题是为谁准备的 —— 多用户共用时，
+    // "我明明选了 B，怎么按 A 的背景问"是最容易被当成故障的现象。
+    $("setupHint").textContent = (d.kind === "url"
+      ? "已抓取网页正文（" + d.chars + " 字符）" : "")
+      + "按「" + me.name + "」的画像生成"
+      + (d.profile_used ? "" : "（还没有该用户的画像，将按通用话题准备）");
   } catch (e) {
     $("setupHint").textContent = "";
     toast("生成失败：" + e.message, 5000);
@@ -1045,7 +1059,12 @@ $("btnStart").onclick = async () => {
 };
 
 $("btnReprepare").onclick = () => {
+  // 备课时用户可能被换成另一个，prepared 就不是这个人（甚至不是
+  // 这个素材）的计划了。不清的话，下次点「开始」会把旧计划
+  // 当成刚生成的显示出来，看着像"改了没反应"。
   $("planCard").classList.add("hidden");
+  prepared = null;
+  $("setupHint").textContent = "";
   $("input").focus();
 };
 

@@ -30,6 +30,7 @@ from ..core.realtime import SessionFatal
 from ..core.voiceprint import SpeakerVerifier
 from ..services.corrector import Corrector
 from ..services.planner import Planner, build_tutor_instructions
+from ..services.plancache import plan_cache
 from ..services.cost import estimate_cost, format_usage, parse_realtime_usage
 from ..services.profile import (INJECT_MIN_CONFIDENCE, ProfileExtractor,
                                 ProfileStore)
@@ -142,6 +143,29 @@ def _user_json(u) -> dict:
     }
 
 
+def _require_user(user_id: Optional[int]):
+    """
+    备课/开练时用：用户必须能明确认出来，取不到就报错。
+
+    这里**刻意不做默认回退**，与 ws_session 保持同一套语义。
+    理由是备课的代价不对称：
+      · 回退到「最近用过的那个人」几乎必然出错 —— 前端选的用户
+        只记在 localStorage 里，服务端并不知道，刷新页面、换标签页
+        都会对不上；一旦对不上，甲的兴趣就会出现在乙的话题里。
+      · 而报错的代价只是"先选个人"，用户一眼就知道该怎么做。
+
+    读接口（历史、画像、统计）用 _resolve_user 就够了：那里错了
+    最多显示空列表，不会把两个人的资料搅在一起。
+    """
+    store = user_store()
+    if user_id is None:
+        raise HTTPException(400, "请先选择用户")
+    try:
+        return store.require(user_id)
+    except UserNotFound:
+        raise HTTPException(404, "所选用户已不存在，请重新选择")
+
+
 def _resolve_user(user_id: Optional[int]):
     """
     把请求里的 user 参数解析成用户对象。
@@ -153,6 +177,8 @@ def _resolve_user(user_id: Optional[int]):
     （读接口给空结果、写接口报错）。这里**不能抛异常**：
     用户被删掉后，停在旧页面上的标签页仍会带着失效的 id 发请求，
     那是正常情况，不该变成 500 把页面整个卡住。
+
+    注意这只适用于读接口。备课请用 _require_user，见上面的说明。
     """
     store = user_store()
     try:
@@ -212,6 +238,10 @@ async def delete_user(user_id: int):
         stats = user_store().delete(user_id)
     except UserNotFound as e:
         raise HTTPException(404, str(e))
+    # 人都不在了，留着他的备课本毫无意义。
+    # 不清也不会立刻出错（键里带 user_id，id 不会被重用），
+    # 但属于无谓留存，顺手清掉。
+    plan_cache().invalidate_user(user_id)
     return {"deleted": True, "stats": stats}
 
 
@@ -427,19 +457,23 @@ class PrepareIn(BaseModel):
 async def prepare(body: PrepareIn, user: Optional[int] = None):
     """
     需求 1：输入主题/段落/文章/网址 → 分析内容并预先规划聊什么。
+
+    需求 6：把**这个用户**的画像注入，让话题贴近他本人。
     """
     text = (body.content or "").strip()
     if not text:
         raise HTTPException(400, "内容不能为空")
 
+    # 备课必须认准人。回退到"最近用过的那个人"会把甲的背景
+    # 掺进乙的话题里，而用户完全看不出问题 —— 见 _require_user。
+    u = _require_user(user)
+
     content = load_content(text)
     if not content.ok:
         raise HTTPException(400, f"内容无法处理：{content.error}")
 
-    # 需求 6：把已知画像注入，让话题更贴近本人
-    u = _resolve_user(user)
     store = profile_store()
-    summary = store.summary(u.id) if u else ""
+    summary = store.summary(u.id)
 
     try:
         plan = await asyncio.to_thread(
@@ -448,10 +482,16 @@ async def prepare(body: PrepareIn, user: Optional[int] = None):
     except Exception as e:
         raise HTTPException(502, f"话题规划失败：{e}")
 
+    # 记下来，让紧接着的「开始」直接用这一份 ——
+    # 否则模型会重新构思一次，用户预览的和实际聊的不是同一批话题。
+    plan_cache().put(u.id, text, plan)
+
     return {
         "kind": content.kind,
         "title": content.title,
         "chars": len(content.text),
+        "user_id": u.id,
+        "profile_used": bool(summary.strip()),
         "plan": plan.to_dict(),
     }
 
@@ -609,6 +649,16 @@ async def ws_session(ws: WebSocket):
         except ValueError:
             minutes = s.session_minutes
 
+        # ---- 画像（备课和会话提示词必须用同一份）----
+        #
+        # 这里只读一次是有意为之：备课（Planner）和语音提示词
+        # （build_tutor_instructions）注入的是**同一个人的**背景。
+        # 分两次读，等于给模型看了两份可能不同的画像 ——
+        # 话题按你的兴趣挑，开场却按别人的经历寒暄，这正是
+        # "不同用户的背景混在一起"最典型的表现。
+        store = profile_store()
+        summary = store.summary(user.id)
+
         # ---- 备课 ----
         content = load_content(raw_content)
         if not content.ok:
@@ -617,15 +667,27 @@ async def ws_session(ws: WebSocket):
             await ws.close()
             return
 
-        await ws.send_json({"type": "status", "stage": "planning"})
-        try:
-            plan = await asyncio.to_thread(Planner().plan, content)
-        except Exception as e:
-            await ws.send_json({"type": "error",
-                                "error": f"话题规划失败：{e}"})
-            await ws.close()
-            return
-        await ws.send_json({"type": "plan", "plan": plan.to_dict()})
+        # 刚才点过「生成话题」就直接用那一份。用户看到的话题和
+        # 真正开练时的话题必须是同一个 —— 让模型重新构思一次，
+        # 预览就只是个参考，看着像"点了没反应"。
+        # 没备过课（直接点开始、或缓存过期）才现场生成。
+        plan = plan_cache().get(user.id, raw_content)
+        reused = plan is not None
+        if not reused:
+            await ws.send_json({"type": "status", "stage": "planning"})
+            try:
+                plan = await asyncio.to_thread(
+                    Planner().plan, content, profile_summary=summary)
+            except Exception as e:
+                await ws.send_json({"type": "error",
+                                    "error": f"话题规划失败：{e}"})
+                await ws.close()
+                return
+            plan_cache().put(user.id, raw_content, plan)
+        else:
+            log.info("复用已备好的话题计划 (user=%s)", user.name)
+        await ws.send_json({"type": "plan", "plan": plan.to_dict(),
+                            "reused": reused})
 
         # ---- 建会话 ----
         sid = db().create_session(
@@ -659,11 +721,8 @@ async def ws_session(ws: WebSocket):
                                "本次不做声纹过滤（旁人说话也会被回应）",
                 })
 
-        store = profile_store()
-        summary = store.summary(user.id)
         instructions = build_tutor_instructions(
             plan, profile_summary=summary, minutes=minutes)
-
         async def on_client(msg: dict) -> None:
             try:
                 await ws.send_json(msg)

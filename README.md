@@ -114,7 +114,7 @@ kai/
 │   ├── storage/          SQLite 存储
 │   └── web/index.html    前端（单文件，无构建步骤）
 ├── scripts/              自检、证书生成、音色列表等工具
-├── tests/                284 个测试
+├── tests/                307 个测试
 ├── docs/                 使用说明、开发计划、诊断记录、选型分析
 └── prototype/            原型期代码（已冻结，仅作对照）
 ```

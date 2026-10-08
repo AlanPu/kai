@@ -7,6 +7,7 @@
 """
 
 import json
+from urllib.parse import quote_plus
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ import pytest
 
 from app.core.enroll import (MAX_SPEECH_SEC, MIN_COHERENCE, MIN_SAMPLES,
                              MIN_SPEECH_SEC, EnrollmentSession)
+from app.services.profile import ProfileStore
 from app.services.users import (DuplicateUser, InvalidUser, UserNotFound,
                                 UserStore, quality_label)
 from app.storage.db import Database
@@ -1756,3 +1758,594 @@ def test_docs_test_count_matches_reality():
     assert claimed, "README 应写明测试数量"
     for c in claimed:
         assert c == actual, f"README 写 {c} 个测试，实际 {actual} 个"
+
+
+# ============================================================
+#  备课必须按"当前选中的用户"
+#
+#  实测踩出来的：网页上明明选了 B，生成的话题却按 A 的背景来。
+#  根因是三处叠加，任何一处单独修都不够 ——
+#
+#    ① 前端 /api/prepare 没带 user（裸 fetch，漏了 api() 包装），
+#       服务端于是回退到"最近用过的那个人"，常常正是 A；
+#    ② WebSocket 备课链路压根没传 profile_summary，
+#       点「开始」时的话题跟「生成话题」预览的不是同一份；
+#    ③ 备课和会话提示词分两次读画像，两份可能不同 ——
+#       话题按你的兴趣挑，开场却按别人的经历寒暄。
+#
+#  下面每一组测试对应其中一处，防止以后又被改回去。
+# ============================================================
+
+class _Recorder:
+    """记录 Planner 实际收到的参数。"""
+
+    def __init__(self, summary):
+        self.summary = summary
+        self.calls: list[dict] = []
+
+    def __call__(self, content, *, profile_summary="", n_topics=5):
+        self.calls.append({"summary": profile_summary,
+                           "n_topics": n_topics})
+        from app.services.planner import Plan, Topic
+        return Plan(opening="hi", background="bg",
+                    topics=[Topic(title="t", prompt="What?")][:1])
+
+
+def _patch_server(store, db, monkeypatch, recorder):
+    """把 server 的依赖换成测试用的 store/db，并挂上假 Planner。"""
+    import app.api.server as srv
+
+    monkeypatch.setattr(srv, "user_store", lambda: store)
+    monkeypatch.setattr(srv, "db", lambda: db)
+    monkeypatch.setattr(srv, "profile_store",
+                        lambda: ProfileStore(db, store.dir.parent / "profiles"))
+
+    class FakePlanner:
+        def __init__(self):
+            self.llm = None
+
+        def plan(self, content, *, profile_summary="", n_topics=5):
+            return recorder(content, profile_summary=profile_summary,
+                            n_topics=n_topics)
+
+    monkeypatch.setattr(srv, "Planner", FakePlanner)
+    return srv
+
+
+def test_prepare_uses_selected_users_own_profile(store, db, monkeypatch):
+    """给 A 备课，注入的必须是 A 的画像，且绝不含 B 的。"""
+    import asyncio
+    from app.services.planner import Plan, Topic
+
+    a = store.create("A")
+    b = store.create("B")
+    db.upsert_fact(ProfileFact(user_id=a.id, category="interest",
+                               key="hobby", value="A 的爱好是爬山",
+                               confidence=0.9))
+    db.upsert_fact(ProfileFact(user_id=b.id, category="interest",
+                               key="hobby", value="B 的爱好是养猫",
+                               confidence=0.9))
+    # 让 B 成为"最近用过的人" —— 正是串味的那个回退目标
+    db.touch_user(a.id)
+    db.touch_user(b.id)
+
+    rec = _Recorder("ignored")
+    srv = _patch_server(store, db, monkeypatch, rec)
+
+    out = asyncio.run(srv.prepare(
+        srv.PrepareIn(content="remote work", topics=5), user=a.id))
+
+    assert rec.calls, "prepare 没有调用 Planner"
+    used = rec.calls[0]["summary"]
+    assert "A 的爱好是爬山" in used
+    assert "养猫" not in used, "备课用到了另一个用户的画像"
+    assert out["user_id"] == a.id
+    assert out["profile_used"] is True
+
+
+def test_prepare_does_not_fall_back_to_another_user(store, db, monkeypatch):
+    """没给 user（或用户已被删）时必须报错，不能悄悄用最近的人。
+
+    回退在这里是纯粹的伤害：用户什么都没做错，却拿到了按
+    别人背景设计的话题，而且界面上完全看不出。
+    """
+    import asyncio
+    from fastapi import HTTPException
+    from app.services.planner import Plan, Topic
+
+    a = store.create("A")
+    db.touch_user(a.id)
+
+    rec = _Recorder("")
+    srv = _patch_server(store, db, monkeypatch, rec)
+
+    # 一个都没给
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(srv.prepare(srv.PrepareIn(content="remote work")))
+    assert e.value.status_code == 400
+
+    # 指向已被删除的用户（另一个标签页残留的旧 id）
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(srv.prepare(
+            srv.PrepareIn(content="remote work"), user=99999))
+    assert e.value.status_code == 404
+
+    assert not rec.calls, "报错前不应该已经调用了模型"
+
+
+def test_prepare_reports_no_profile_for_new_user(store, db, monkeypatch):
+    """新用户没有画像是正常的，要如实告诉前端（而不是静默按通用备）。"""
+    import asyncio
+    from app.services.planner import Plan, Topic
+
+    a = store.create("A")
+    rec = _Recorder("")
+    srv = _patch_server(store, db, monkeypatch, rec)
+
+    out = asyncio.run(srv.prepare(
+        srv.PrepareIn(content="remote work"), user=a.id))
+    assert out["profile_used"] is False
+    assert rec.calls[0]["summary"] == ""
+
+
+def _plan_call_keywords(caller: str):
+    """
+    取出某函数里所有 `Planner().plan(...)` 调用的关键字参数名。
+
+    实际写法是 `asyncio.to_thread(Planner().plan, content, kw=...)` ——
+    plan 是传给 to_thread 的第一个实参，不在 Call 位置上，
+    所以要同时认「直接调用」和「to_thread 的首参」两种形态。
+
+    用 AST 而不是正则：`profile_summary=summary` 这段文本在
+    `build_tutor_instructions` 调用里同样存在，正则会误判成
+    "备课传了画像" —— 那正是假测试绿着放过真 bug 的原因。
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse(
+        (root / "app" / "api" / "server.py").read_text(encoding="utf-8"))
+
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == caller)
+
+    def is_plan(node) -> bool:
+        """节点是不是 `Planner().plan` 这个属性访问。"""
+        return (isinstance(node, ast.Attribute)
+                and node.attr == "plan"
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "Planner")
+
+    found = []
+    for node in ast.walk(fn):
+        # 形态一：Planner().plan(content, kw=...)
+        if (isinstance(node, ast.Call) and is_plan(node.func)):
+            found.append({kw.arg for kw in node.keywords})
+        # 形态二：asyncio.to_thread(Planner().plan, content, kw=...)
+        elif (isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "to_thread"
+              and node.args and is_plan(node.args[0])):
+            found.append({kw.arg for kw in node.keywords})
+    return found
+
+
+def test_ws_planning_injects_profile():
+    """
+    WS 备课必须传 profile_summary —— 点「开始」走的就是这条链路。
+
+    这条最容易被漏掉：它不报错、不崩溃，只是让「生成话题」看到的
+    预览和真正开始练习时聊的内容对不上。
+    """
+    calls = _plan_call_keywords("ws_session")
+    assert calls, "ws_session 里没找到 Planner().plan(...) 调用"
+
+    for kws in calls:
+        assert "profile_summary" in kws, (
+            "WS 备课链路没有注入画像（server.py:ws_session 的 "
+            f"Planner().plan 调用，实际关键字：{kws}）")
+
+
+def test_prepare_plan_call_injects_profile():
+    """/api/prepare 的备课同样必须注入画像。"""
+    calls = _plan_call_keywords("prepare")
+    assert calls, "prepare 里没找到 Planner().plan(...) 调用"
+    for kws in calls:
+        assert "profile_summary" in kws, \
+            f"/api/prepare 备课没有注入画像，实际关键字：{kws}"
+
+
+def test_ws_planning_and_tutor_share_one_summary():
+    """备课和会话提示词必须用同一份画像，不能各读一次。"""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse(
+        (root / "app" / "api" / "server.py").read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "ws_session")
+
+    # 形如 store.summary(user.id) 的调用
+    reads = [n for n in ast.walk(fn)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "summary"]
+    assert len(reads) == 1, (
+        f"画像应只读一次，实际读了 {len(reads)} 次 —— "
+        "备课和提示词可能用了不同的背景")
+
+
+def test_frontend_prepare_sends_user():
+    """前端「生成话题」必须带 user，否则服务端不知道为谁备课。"""
+    import re as _re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "app" / "web" / "index.html").read_text(encoding="utf-8")
+
+    # 取出 btnPrepare 的处理函数
+    m = _re.search(r'\$[(]?"btnPrepare"[)]?\.onclick\s*=\s*async\s*\(\)\s*=>\s*\{'
+                   r'(.*?)\n\};', html, _re.S)
+    assert m, "没找到 btnPrepare 的处理函数"
+    body = m.group(1)
+
+    # 关键：必须走 api()（它负责追加 user=），不能是裸 "/api/prepare"
+    assert 'api("/api/prepare")' in body, \
+        "生成话题没走 api()，user 参数不会被带上"
+    assert 'fetch("/api/prepare"' not in body, \
+        "生成话题仍在用裸 fetch，服务端会回退到最近使用的用户"
+
+    # 没选用户时要拦住：报错总比用错人的画像强
+    assert "if (!me)" in body, "没选用户就备课，会用到别人的背景"
+
+
+def test_frontend_reprepare_clears_stale_plan():
+    """「换个话题」要清掉旧的 prepared，否则会把旧计划当成新的显示。"""
+    import re as _re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "app" / "web" / "index.html").read_text(encoding="utf-8")
+
+    m = _re.search(r'\$[(]?"btnReprepare"[)]?\.onclick\s*=\s*\(\)\s*=>\s*\{'
+                   r'(.*?)\n\};', html, _re.S)
+    assert m, "没找到 btnReprepare 的处理函数"
+    assert "prepared = null" in m.group(1), \
+        "「换个话题」没清 prepared，旧计划会被误显示"
+
+
+def test_switching_user_clears_plan_hint():
+    """切换用户后要清掉"按某某生成"的提示，否则会显示成上一个人的。"""
+    import re as _re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "app" / "web" / "index.html").read_text(encoding="utf-8")
+
+    m = _re.search(r'box\.querySelectorAll\("\.urow"\)\.forEach\(row\s*=>\s*\{'
+                   r'(.*?)\n\s{4}\}\);', html, _re.S)
+    assert m, "没找到切换用户的处理代码"
+    body = m.group(1)
+    assert "prepared = null" in body
+    assert 'setupHint' in body, "切换用户后应清掉备课提示"
+
+
+# ============================================================
+#  两次备课必须完全一致
+#
+#  「生成话题」和点「开始」各调一次 Planner，即使两边注入的是
+#  同一份画像，模型重新构思仍会给出不同的话题 ——
+#  界面上预览的是 A，真正开练时聊的是 B。
+#  用户看到的不是"话题被优化了"，而是"我刚点的没用"。
+#
+#  做法：/api/prepare 把结果按 (user_id, 内容指纹) 记进进程内缓存，
+#  WS 建连时命中就直接复用，不再调模型。
+# ============================================================
+
+class _FakeWS:
+    """够用的 WebSocket 替身，记录发出去的消息。"""
+
+    def __init__(self, query: str):
+        from urllib.parse import parse_qs, urlparse
+        p = urlparse("ws://x/session?" + query)
+        self.query_params = {k: v[0] for k, v in parse_qs(p.query).items()}
+        self.sent: list[dict] = []
+        self.closed = False
+
+    async def accept(self):
+        pass
+
+    async def send_json(self, data):
+        self.sent.append(data)
+
+    async def close(self):
+        self.closed = True
+
+    async def receive_json(self):
+        return {"type": "end"}
+
+
+def _make_plan(tag: str):
+    from app.services.planner import Plan, Topic
+    return Plan(opening=f"hi-{tag}", background=tag,
+                topics=[Topic(title=tag, prompt=f"What about {tag}?")])
+
+
+def test_plan_cache_roundtrip():
+    from app.services.plancache import PlanCache
+
+    c = PlanCache()
+    c.put(1, "remote work", _make_plan("a"))
+    got = c.get(1, "remote work")
+    assert got is not None and got.opening == "hi-a"
+
+
+def test_plan_cache_miss_returns_none():
+    from app.services.plancache import PlanCache
+
+    c = PlanCache()
+    assert c.get(1, "never prepared") is None
+
+
+def test_plan_cache_isolates_users():
+    """同一段素材、两个用户，必须各拿各的计划。"""
+    from app.services.plancache import PlanCache
+
+    c = PlanCache()
+    c.put(1, "same article", _make_plan("A的"))
+    c.put(2, "same article", _make_plan("B的"))
+    assert c.get(1, "same article").opening == "hi-A的"
+    assert c.get(2, "same article").opening == "hi-B的"
+
+
+def test_plan_cache_isolates_content():
+    """改了输入内容就不能复用旧计划 —— 否则开练时聊的不是他此刻想聊的。"""
+    from app.services.plancache import PlanCache
+
+    c = PlanCache()
+    c.put(1, "remote work", _make_plan("a"))
+    assert c.get(1, "remote work benefits") is None
+
+
+def test_plan_cache_ignores_surrounding_whitespace():
+    """复制粘贴常带首尾空白，那还是同一份素材。"""
+    from app.services.plancache import PlanCache
+
+    c = PlanCache()
+    c.put(1, "remote work", _make_plan("a"))
+    assert c.get(1, "  remote work\n ") is not None
+
+
+def test_plan_cache_is_case_sensitive():
+    """
+    大小写不同就该算不同素材。
+
+    这条看着吹毛求疵，但归一化大小写会导致「Remote work」
+    复用为「remote work」的计划 —— 后者可能聊的是完全不同的角度。
+    """
+    from app.services.plancache import PlanCache
+
+    c = PlanCache()
+    c.put(1, "Remote work", _make_plan("a"))
+    assert c.get(1, "remote work") is None
+
+
+def test_plan_cache_expires():
+    from app.services.plancache import PlanCache
+
+    c = PlanCache(ttl_sec=0.0)
+    c.put(1, "x", _make_plan("a"))
+    assert c.get(1, "x") is None, "过期条目不该再被复用"
+
+
+def test_plan_cache_evicts_oldest_when_full():
+    from app.services.plancache import PlanCache
+
+    c = PlanCache(max_entries=3)
+    for i in range(5):
+        c.put(1, f"content-{i}", _make_plan(str(i)))
+    assert len(c) == 3
+    assert c.get(1, "content-0") is None, "最旧的应被淘汰"
+    assert c.get(1, "content-4") is not None, "最新的必须还在"
+
+
+def test_plan_cache_invalidate_user():
+    """画像更新后要能作废该用户已备好的计划。"""
+    from app.services.plancache import PlanCache
+
+    c = PlanCache()
+    c.put(1, "x", _make_plan("a"))
+    c.put(2, "x", _make_plan("b"))
+    c.invalidate_user(1)
+    assert c.get(1, "x") is None
+    assert c.get(2, "x") is not None, "不能连累别的用户"
+
+
+def test_prepare_then_ws_reuses_same_plan(store, db, monkeypatch):
+    """
+    端到端：「生成话题」后紧接着开练，必须是同一份计划、只调一次模型。
+
+    这是本次改动的核心断言。没有它，回归表现为"话题每次都不一样"，
+    而那既不报错也不崩溃，只能靠用户抱怨才发现。
+    """
+    import asyncio
+    from app.services.plancache import PlanCache, plan_cache
+
+    import app.api.server as srv
+
+    calls = []
+
+    class FakePlanner:
+        def __init__(self):
+            pass
+
+        def plan(self, content, *, profile_summary="", n_topics=5):
+            calls.append(profile_summary)
+            # 每次返回不同内容：若真调了两次，用户就能看出两份不一样
+            return _make_plan(f"第{len(calls)}次")
+
+    # 隔离的缓存，避免污染其他测试
+    fake_cache = PlanCache()
+    monkeypatch.setattr(srv, "user_store", lambda: store)
+    monkeypatch.setattr(srv, "db", lambda: db)
+    monkeypatch.setattr(srv, "profile_store",
+                        lambda: ProfileStore(db, store.dir.parent / "profiles"))
+    monkeypatch.setattr(srv, "plan_cache", lambda: fake_cache)
+    monkeypatch.setattr(srv, "Planner", FakePlanner)
+
+    a = store.create("A")
+
+    # 第一次：HTTP 备课
+    out = asyncio.run(srv.prepare(
+        srv.PrepareIn(content="remote work", topics=5), user=a.id))
+    assert len(calls) == 1
+
+    # 第二次：WS 开练。这里只验到"计划被取用"为止，
+    # 不真建连 —— 建连要连 Realtime 服务，不是单测该做的事。
+    cached = fake_cache.get(a.id, "remote work")
+    assert cached is not None, "HTTP 备课的结果没有被记下"
+    assert cached.opening == out["plan"]["opening"] == "hi-第1次"
+    assert len(calls) == 1, "WS 不该重新备课"
+
+
+def test_ws_does_not_reuse_other_users_plan(store, db, monkeypatch):
+    """A 备完课不能被 B 复用 —— 同一段素材也不行。"""
+    import asyncio
+    from app.services.plancache import PlanCache
+
+    import app.api.server as srv
+
+    calls = []
+
+    class FakePlanner:
+        def __init__(self):
+            pass
+
+        def plan(self, content, *, profile_summary="", n_topics=5):
+            calls.append(1)
+            return _make_plan(f"第{len(calls)}次")
+
+    fake_cache = PlanCache()
+    monkeypatch.setattr(srv, "user_store", lambda: store)
+    monkeypatch.setattr(srv, "db", lambda: db)
+    monkeypatch.setattr(srv, "profile_store",
+                        lambda: ProfileStore(db, store.dir.parent / "profiles"))
+    monkeypatch.setattr(srv, "plan_cache", lambda: fake_cache)
+    monkeypatch.setattr(srv, "Planner", FakePlanner)
+
+    a = store.create("A")
+    b = store.create("B")
+
+    asyncio.run(srv.prepare(srv.PrepareIn(content="same"), user=a.id))
+    assert fake_cache.get(b.id, "same") is None, \
+        "B 拿到了 A 的备课本 —— 这正是最初要修的串味"
+
+
+def test_session_profile_update_invalidates_cache(store, db, monkeypatch):
+    """画像更新后，之前按旧画像备好的计划必须作废。"""
+    from app.services.plancache import PlanCache
+    from app.services.profile import ProfileStore
+    from app.storage.models import ProfileFact
+    import app.services.session as session_mod
+    from app.services.session import invalidate_plan_cache
+
+    fake_cache = PlanCache()
+    monkeypatch.setattr(session_mod, "plan_cache", lambda: fake_cache)
+
+    a = store.create("A")
+    fake_cache.put(a.id, "remote work", _make_plan("按旧画像"))
+
+    # 模拟一次成功的画像抽取
+    ps = ProfileStore(db, store.dir.parent / "profiles")
+    ps.absorb(a.id, [ProfileFact(user_id=a.id, category="interest",
+                                key="hobby", value="爬山", confidence=0.9)])
+    invalidate_plan_cache(a.id)
+
+    assert fake_cache.get(a.id, "remote work") is None, \
+        "画像变了却还在用旧计划，用户会被拿过去的自己问话"
+
+
+def test_deleting_user_clears_cache(store, db, monkeypatch):
+    import asyncio
+    from app.services.plancache import PlanCache
+    import app.api.server as srv
+
+    fake_cache = PlanCache()
+    monkeypatch.setattr(srv, "user_store", lambda: store)
+    monkeypatch.setattr(srv, "plan_cache", lambda: fake_cache)
+
+    a = store.create("A")
+    b = store.create("B")
+    fake_cache.put(a.id, "x", _make_plan("a"))
+    fake_cache.put(b.id, "x", _make_plan("b"))
+
+    asyncio.run(srv.delete_user(a.id))
+    assert fake_cache.get(a.id, "x") is None
+    assert fake_cache.get(b.id, "x") is not None
+
+
+def test_ws_actually_reuses_cached_plan(store, db, monkeypatch):
+    """
+    走真实的 ws_session，验证它真的**取用**了缓存，而不只是缓存里有。
+
+    上面那个测试只证明了"写进去了"，没证明"读出来了" ——
+    这两件事中间隔着整个 WS 流程，是最容易悄悄断掉的地方。
+
+    在 build_tutor_instructions 处截断：不往下走 sess.start()，
+    因为那会真连 Realtime 服务，不该出现在单测里。
+    截断点选在这里，是因为它正好消费 plan，是验证"用对了"的最后一道。
+    """
+    import asyncio
+    from app.services.plancache import PlanCache
+    import app.api.server as srv
+
+    calls = []
+    seen = {}
+
+    class FakePlanner:
+        def __init__(self):
+            pass
+
+        def plan(self, content, *, profile_summary="", n_topics=5):
+            calls.append(1)
+            return _make_plan(f"第{len(calls)}次")
+
+    def fake_build(plan, *, profile_summary="", minutes=30):
+        # 在这里停住，并记下收到的计划。
+        # 抛 srv._StopRequested 走的是正常收尾路径 —— ws_session 有
+        # except 分支接住它，不会变成报错而掩盖真正的断言失败。
+        seen["opening"] = plan.opening
+        seen["topics"] = [t.title for t in plan.topics]
+        raise srv._StopRequested()
+
+    fake_cache = PlanCache()
+    monkeypatch.setattr(srv, "user_store", lambda: store)
+    monkeypatch.setattr(srv, "db", lambda: db)
+    monkeypatch.setattr(srv, "profile_store",
+                        lambda: ProfileStore(db, store.dir.parent / "profiles"))
+    monkeypatch.setattr(srv, "plan_cache", lambda: fake_cache)
+    monkeypatch.setattr(srv, "Planner", FakePlanner)
+    monkeypatch.setattr(srv, "build_tutor_instructions", fake_build)
+
+    a = store.create("A")
+    asyncio.run(srv.prepare(srv.PrepareIn(content="remote work"), user=a.id))
+    assert len(calls) == 1
+    expected = "第1次"
+
+    ws = _FakeWS(f"user={a.id}&content=" + quote_plus("remote work")
+                 + "&voiceprint=0")
+    asyncio.run(srv.ws_session(ws))
+
+    assert seen, "没有走到 build_tutor_instructions"
+    assert len(calls) == 1, \
+        f"WS 又调了一次 Planner（应为 {expected}，实际调了 {len(calls)} 次）"
+    assert seen["opening"] == f"hi-{expected}", \
+        f"WS 用的是 {seen['opening']}，与预览的 hi-{expected} 不一致"
+
+    # 发给前端的 plan 事件也应标明是复用
+    plan_msgs = [m for m in ws.sent if m.get("type") == "plan"]
+    assert plan_msgs, "没有下发 plan"
+    assert plan_msgs[0]["reused"] is True, "前端会误以为又重新备了一次课"

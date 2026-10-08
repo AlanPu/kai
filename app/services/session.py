@@ -27,9 +27,15 @@ from ..core.voiceprint import SpeakerVerifier
 from ..storage.db import Database
 from ..storage.models import Correction, Turn
 from .corrector import Corrector
+from .plancache import plan_cache
 from .profile import ProfileExtractor, ProfileStore
 
 log = logging.getLogger(__name__)
+
+
+def invalidate_plan_cache(user_id: int) -> None:
+    """画像变了就作废该用户已备好的话题计划（见 plancache 的说明）。"""
+    plan_cache().invalidate_user(user_id)
 
 
 
@@ -646,6 +652,9 @@ class ConversationSession:
                                          session_id=self.session_id)
             log.info("画像更新 %d 条: %s", n,
                      ", ".join(f"{f.key}={f.value}" for f in facts[:4]))
+            # 画像变了，之前按旧画像备好的话题就不再贴合本人了。
+            # 不清的话，用户会拿着"过去的他"问出"现在的他"的话题。
+            invalidate_plan_cache(self.user_id)
             await self.on_client({
                 "type": "profile_learned",
                 "facts": [{"category": f.category, "value": f.value}
