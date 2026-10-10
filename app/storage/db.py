@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .models import (Correction, CorrectionKind, InputKind, ProfileFact,
-                     Session, SessionStatus, Turn, User)
+                     ReviewHabitRow, ReviewItem, Session, SessionStatus, Turn,
+                     User)
 
 log = logging.getLogger(__name__)
 
@@ -430,6 +431,183 @@ class Database:
         rows = self.conn.execute(sql, args).fetchall()
         return [_row_to_fact(r) for r in rows]
 
+    # ---------- 复习 ----------
+
+    def upsert_review_habit(self, h: ReviewHabitRow) -> int:
+        """
+        写入/累加一类反复出现的问题。
+
+        已存在时：累加 occurrences、刷新 last_seen，
+        并保留用户的 mastered 标记 —— 复习过的成果不能被
+        下一次练习覆盖掉（那样"已掌握"永远归零）。
+        """
+        row = self.conn.execute(
+            "SELECT id, occurrences FROM review_habits "
+            "WHERE user_id=? AND habit=?",
+            (h.user_id, h.habit)).fetchone()
+        if row:
+            # 用 MAX 兜底：调用方传进来的 occurrences 是"新一次"的
+            # 增量，不是总数，两个来源取较大值都能推进计数。
+            self.conn.execute(
+                """UPDATE review_habits
+                   SET title=?, advice=COALESCE(?, advice),
+                       occurrences=occurrences + ?,
+                       last_seen=COALESCE(?, last_seen),
+                       updated_at=?
+                   WHERE id=?""",
+                (h.title, h.advice, max(1, h.occurrences),
+                 h.last_seen, _now(), row["id"]))
+            self.conn.commit()
+            return int(row["id"])
+
+        cur = self.conn.execute(
+            """INSERT INTO review_habits
+               (user_id, habit, title, advice, occurrences,
+                first_seen, last_seen)
+               VALUES (?,?,?,?,?,?,?)""",
+            (h.user_id, h.habit, h.title, h.advice,
+             max(1, h.occurrences), h.first_seen, h.last_seen))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def upsert_review_item(self, it: ReviewItem) -> int:
+        """
+        写入/累加一条具体说法。
+
+        按 (user_id, dedup_key) 去重：同一句 "I went to the."
+        重复出现时只累加次数，不再插入新行 ——
+        否则复习清单会被同一句话刷屏。
+        """
+        row = self.conn.execute(
+            "SELECT id FROM review_items WHERE user_id=? AND dedup_key=?",
+            (it.user_id, it.dedup_key)).fetchone()
+        if row:
+            self.conn.execute(
+                """UPDATE review_items
+                   SET occurrences = occurrences + ?,
+                       suggestion=?, note=COALESCE(?, note),
+                       collocation=COALESCE(?, collocation),
+                       last_seen=COALESCE(?, last_seen),
+                       habit_id=COALESCE(?, habit_id),
+                       updated_at=?
+                   WHERE id=?""",
+                (max(1, it.occurrences), it.suggestion, it.note,
+                 it.collocation, it.last_seen, it.habit_id, _now(),
+                 row["id"]))
+            self.conn.commit()
+            return int(row["id"])
+
+        cur = self.conn.execute(
+            """INSERT INTO review_items
+               (user_id, habit_id, dedup_key, original, suggestion, note,
+                collocation, occurrences, first_seen, last_seen,
+                source_session_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (it.user_id, it.habit_id, it.dedup_key, it.original,
+             it.suggestion, it.note, it.collocation,
+             max(1, it.occurrences), it.first_seen, it.last_seen,
+             it.source_session_id))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_review_habits(self, user_id: int,
+                           include_mastered: bool = False
+                           ) -> list[ReviewHabitRow]:
+        """按出现次数从高到低 —— 最该复习的排最前面。"""
+        sql = "SELECT * FROM review_habits WHERE user_id = ?"
+        args: list[Any] = [user_id]
+        if not include_mastered:
+            sql += " AND mastered = 0"
+        sql += " ORDER BY occurrences DESC, id"
+        rows = self.conn.execute(sql, args).fetchall()
+        return [_row_to_review_habit(r) for r in rows]
+
+    def list_review_items(self, user_id: int, habit_id: Optional[int] = None,
+                          include_mastered: bool = False) -> list[ReviewItem]:
+        sql = "SELECT * FROM review_items WHERE user_id = ?"
+        args: list[Any] = [user_id]
+        if habit_id is not None:
+            sql += " AND habit_id = ?"
+            args.append(habit_id)
+        if not include_mastered:
+            sql += " AND mastered = 0"
+        sql += " ORDER BY occurrences DESC, id"
+        rows = self.conn.execute(sql, args).fetchall()
+        return [_row_to_review_item(r) for r in rows]
+
+    def set_review_mastered(self, user_id: int, *, habit_id: Optional[int] = None,
+                            item_id: Optional[int] = None,
+                            mastered: bool = True) -> int:
+        """
+        标记"已掌握" / 取消标记。
+
+        带 user_id 条件：否则传入别人的 id 就能改到别人的记录。
+        返回实际影响的行数，便于上层判断 id 是否存在。
+        """
+        stamp = _now() if mastered else None
+        if habit_id is not None:
+            cur = self.conn.execute(
+                """UPDATE review_habits
+                   SET mastered=?, mastered_at=?, updated_at=?
+                   WHERE id=? AND user_id=?""",
+                (int(mastered), stamp, _now(), habit_id, user_id))
+        elif item_id is not None:
+            cur = self.conn.execute(
+                """UPDATE review_items
+                   SET mastered=?, mastered_at=?, updated_at=?
+                   WHERE id=? AND user_id=?""",
+                (int(mastered), stamp, _now(), item_id, user_id))
+        else:
+            return 0
+        self.conn.commit()
+        return cur.rowcount
+
+    def clear_review(self, user_id: int) -> None:
+        """清空该用户的复习数据（重新归纳前调用）。"""
+        self.conn.execute("DELETE FROM review_items WHERE user_id = ?",
+                          (user_id,))
+        self.conn.execute("DELETE FROM review_habits WHERE user_id = ?",
+                          (user_id,))
+        self.conn.commit()
+
+    def list_corrections_for_user(self, user_id: int,
+                                  session_id: Optional[int] = None
+                                  ) -> list[Correction]:
+        """
+        某用户的全部纠错（跨会话），带 session_id。
+
+        复习归纳要"跨会话看重复"，所以必须能一次取全，
+        而不是像 list_corrections 那样一次只取一个会话。
+        """
+        sql = """SELECT c.* FROM corrections c
+                 JOIN sessions s ON s.id = c.session_id
+                 WHERE s.user_id = ?"""
+        args: list[Any] = [user_id]
+        if session_id is not None:
+            sql += " AND c.session_id = ?"
+            args.append(session_id)
+        sql += " ORDER BY c.session_id, c.id"
+        rows = self.conn.execute(sql, args).fetchall()
+        return [_row_to_correction(r) for r in rows]
+
+    def count_review(self, user_id: int) -> dict:
+        """复习页顶部概览用。"""
+        def one(sql: str) -> int:
+            return int(self.conn.execute(sql, (user_id,)).fetchone()[0])
+
+        return {
+            "habits": one("SELECT COUNT(*) FROM review_habits "
+                          "WHERE user_id=? AND mastered=0"),
+            "items": one("SELECT COUNT(*) FROM review_items "
+                         "WHERE user_id=? AND mastered=0"),
+            "mastered": one("SELECT COUNT(*) FROM review_habits "
+                            "WHERE user_id=? AND mastered=1")
+            + one("SELECT COUNT(*) FROM review_items "
+                  "WHERE user_id=? AND mastered=1"),
+            "occurrences": one("SELECT COALESCE(SUM(occurrences),0) "
+                               "FROM review_habits WHERE user_id=?"),
+        }
+
 
 # ============================================================
 #  行 → 模型
@@ -476,5 +654,27 @@ def _row_to_fact(r: sqlite3.Row) -> ProfileFact:
         id=r["id"], user_id=r["user_id"], category=r["category"],
         key=r["key"], value=r["value"],
         confidence=r["confidence"],
+        source_session_id=r["source_session_id"],
+        created_at=r["created_at"], updated_at=r["updated_at"])
+
+
+def _row_to_review_habit(r: sqlite3.Row) -> ReviewHabitRow:
+    return ReviewHabitRow(
+        id=r["id"], user_id=r["user_id"], habit=r["habit"],
+        title=r["title"], advice=r["advice"],
+        occurrences=r["occurrences"],
+        first_seen=r["first_seen"], last_seen=r["last_seen"],
+        mastered=bool(r["mastered"]), mastered_at=r["mastered_at"],
+        created_at=r["created_at"], updated_at=r["updated_at"])
+
+
+def _row_to_review_item(r: sqlite3.Row) -> ReviewItem:
+    return ReviewItem(
+        id=r["id"], user_id=r["user_id"], habit_id=r["habit_id"],
+        dedup_key=r["dedup_key"], original=r["original"],
+        suggestion=r["suggestion"], note=r["note"],
+        collocation=r["collocation"], occurrences=r["occurrences"],
+        first_seen=r["first_seen"], last_seen=r["last_seen"],
+        mastered=bool(r["mastered"]), mastered_at=r["mastered_at"],
         source_session_id=r["source_session_id"],
         created_at=r["created_at"], updated_at=r["updated_at"])

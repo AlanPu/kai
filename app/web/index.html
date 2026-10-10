@@ -149,6 +149,7 @@ h1{font-size:19px;margin:0;font-weight:600}
     <span class="pill" id="pVoice">—</span>
     <div class="spacer"></div>
     <button class="ghost" id="btnVoice">音色</button>
+    <button class="ghost" id="btnReview">复习</button>
     <button class="ghost" id="btnProfile">我的画像</button>
     <button class="ghost" id="btnHistory">历史</button>
   </header>
@@ -288,6 +289,23 @@ h1{font-size:19px;margin:0;font-weight:600}
       <button class="ghost" id="btnCloseProfile">关闭</button>
     </div>
     <div id="profileBody"></div>
+  </div>
+</div>
+
+<div id="reviewModal" class="hidden"
+  style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;
+  display:flex;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="max-width:760px;width:100%;max-height:86vh;
+    overflow-y:auto">
+    <div class="ctrls" style="margin-bottom:10px">
+      <h2 style="margin:0">复习：我老是犯的问题</h2>
+      <div class="spacer"></div>
+      <button class="ghost" id="btnReviewRebuild"
+        title="按最新的练习记录重新归纳">重新归纳</button>
+      <button class="ghost" id="btnCloseReview">关闭</button>
+    </div>
+    <div class="hint" id="reviewHead" style="margin-bottom:12px"></div>
+    <div id="reviewBody"></div>
   </div>
 </div>
 
@@ -1206,6 +1224,175 @@ $("btnCloseProfile").onclick = () =>
 $("profileModal").onclick = e => {
   if (e.target === $("profileModal"))
     $("profileModal").classList.add("hidden");
+};
+
+// ============================================================
+//  复习：反复犯的问题
+//
+//  与「历史」的区别：历史是流水账，复习是归纳 ——
+//  同一句 "I went to the." 出现过 7 次，历史里是 7 条互不相干
+//  的记录，这里只剩一行「12 次」。
+// ============================================================
+
+async function loadReview() {
+  const box = $("reviewBody");
+  const head = $("reviewHead");
+  let d;
+  try {
+    const r = await fetch(api("/api/review"));
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    d = await r.json();
+  } catch (err) {
+    // 静默失败会让界面看起来「点了没反应」，这里必须说出来
+    console.error("[复习] 加载失败", err);
+    box.innerHTML = '<p class="hint">读取失败：' + esc(err.message || err)
+      + '</p>';
+    $("reviewModal").classList.remove("hidden");
+    return;
+  }
+
+  if (d.no_user) {
+    box.innerHTML = '<p class="hint">先选择或新建一个用户。</p>';
+    $("reviewModal").classList.remove("hidden");
+    return;
+  }
+
+  const c = d.counts || {};
+  if (!d.habits || !d.habits.length) {
+    head.textContent = "";
+    box.innerHTML = '<p class="hint">还没有归纳出反复出现的问题。'
+      + '多练几次后，这里会把重复犯的错归成一类一类。</p>'
+      + '<p class="hint">已经有练习记录的话，点右上角「重新归纳」。</p>';
+    $("reviewModal").classList.remove("hidden");
+    return;
+  }
+
+  head.innerHTML = '归纳出 <b>' + c.habits + '</b> 类反复出现的问题 · '
+    + '累计 <b>' + c.occurrences + '</b> 次 · '
+    + '<b>' + c.items + '</b> 条具体说法待复习'
+    + (c.mastered ? ' · 已掌握 ' + c.mastered : '');
+
+  let html = "";
+  d.habits.forEach(h => {
+    // 出现次数决定视觉权重：老毛病要一眼看见
+    const lvl = h.occurrences >= 20 ? "critical"
+      : h.occurrences >= 5 ? "minor" : "ignore";
+    html += '<div style="margin-bottom:18px">';
+    html += '<div class="ctrls" style="align-items:baseline">'
+      + '<h3 style="margin:0">' + esc(h.title)
+      + ' <span class="hint" style="font-weight:400">'
+      + esc(h.habit) + '</span></h3>'
+      + '<div class="spacer"></div>'
+      + '<span class="pill" style="color:' + (lvl === "critical"
+          ? "var(--err)" : lvl === "minor" ? "var(--warn)" : "var(--dim)")
+      + '">' + h.occurrences + ' 次</span>'
+      + '<button class="ghost" data-master-habit="' + h.id
+      + '" style="font-size:12px;padding:2px 10px">已改掉</button>'
+      + '</div>';
+
+    if (h.advice) {
+      html += '<div class="hint" style="margin:4px 0 8px">'
+        + esc(h.advice) + '</div>';
+    }
+
+    (h.items || []).forEach(it => {
+      html += '<div class="corr ' + lvl + '" style="margin-bottom:6px">';
+      html += '<div><span style="color:var(--err)">'
+        + esc(it.original) + '</span>'
+        + ' <span class="hint">→</span> '
+        + '<span style="color:var(--ok)">' + esc(it.suggestion)
+        + '</span>';
+      // 短到像「固定说法」的条目单独标出来 —— 这些最值得直接背。
+      // 判断依据是长度：1~4 个词的修正多半是一个搭配块
+      // （"one page at a time"、"On Sundays"），而不是整句重写。
+      // 注意：不能用 collocation 字段来判断 —— 它由后端按
+      // "建议是不是短语"算出来，值恒等于 suggestion，
+      // 拿它和自己比永远是 false（查过真实数据：140/140 相同）。
+      const cw = String(it.suggestion || "").split(/\s+/).filter(Boolean);
+      if (cw.length >= 1 && cw.length <= 4) {
+        html += ' <span class="pill" style="color:var(--accent)">'
+          + '搭配</span>';
+      }
+      if (it.occurrences > 1) {
+        html += ' <span class="hint">×' + it.occurrences + '</span>';
+      }
+      html += '<button class="ghost" data-master-item="' + it.id
+        + '" style="float:right;font-size:11px;padding:1px 8px">'
+        + '掌握</button>';
+      html += '</div>';
+      if (it.note) {
+        html += '<div class="hint" style="font-size:12px;margin-top:2px">'
+          + esc(it.note) + '</div>';
+      }
+      html += '</div>';
+    });
+    html += '</div>';
+  });
+
+  box.innerHTML = html;
+
+  // 打勾 = 标记已掌握。用事件委托，避免给每个按钮单独绑。
+  box.querySelectorAll("[data-master-item]").forEach(btn => {
+    btn.onclick = () => markMastered("items", btn.dataset.masterItem, btn);
+  });
+  box.querySelectorAll("[data-master-habit]").forEach(btn => {
+    btn.onclick = () => markMastered("habits", btn.dataset.masterHabit, btn);
+  });
+
+  $("reviewModal").classList.remove("hidden");
+}
+
+async function markMastered(kind, id, btn) {
+  btn.disabled = true;
+  try {
+    const r = await fetch(api("/api/review/" + kind + "/" + id + "/mastered"), {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({mastered: true}),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    toast("已标记，不再出现在复习清单里");
+    await loadReview();     // 重新拉，保证计数和列表一致
+  } catch (err) {
+    console.error("[复习] 标记失败", err);
+    toast("标记失败：" + (err.message || err));
+    btn.disabled = false;
+  }
+}
+
+$("btnReview").onclick = loadReview;
+
+$("btnCloseReview").onclick = () =>
+  $("reviewModal").classList.add("hidden");
+
+$("reviewModal").onclick = e => {
+  if (e.target === $("reviewModal"))
+    $("reviewModal").classList.add("hidden");
+};
+
+$("btnReviewRebuild").onclick = async () => {
+  const btn = $("btnReviewRebuild");
+  btn.disabled = true;
+  btn.textContent = "归纳中…";
+  try {
+    const r = await fetch(api("/api/review/rebuild"), {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      // reset: true —— 重建就该是重建。增量会把同一批历史错误
+      // 重复计数，次数（= 复习优先级）就虚高了。
+      body: JSON.stringify({reset: true, min_occurrences: 2}),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    toast("重新归纳完成：" + d.habits + " 类问题");
+    await loadReview();
+  } catch (err) {
+    console.error("[复习] 归纳失败", err);
+    toast("归纳失败：" + (err.message || err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "重新归纳";
+  }
 };
 
 $("btnHistory").onclick = async () => {

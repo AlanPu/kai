@@ -120,3 +120,77 @@ class ProfileFact:
     source_session_id: Optional[int] = None
     created_at: str = ""
     updated_at: str = ""
+
+
+# ============================================================
+#  复习：反复犯的问题
+# ============================================================
+
+# 受控词表。加新类型时**必须**同步改这里和 schema.sql 的注释 ——
+# 它是聚合的分组键，放任自由文本会让同类问题被拆散。
+ReviewHabit = Literal[
+    "fragment", "duplication", "missing_subject", "tense", "article",
+    "preposition", "agreement", "word_choice", "collocation",
+    "chinglish", "pronunciation", "fluency",
+]
+
+# 类型 → 中文标签。界面和导出都用它，避免各处硬编码中文。
+HABIT_LABELS: dict[str, str] = {
+    "fragment": "句子说完整",
+    "duplication": "别重复、别重启",
+    "missing_subject": "补上主语",
+    "tense": "时态",
+    "article": "冠词",
+    "preposition": "介词",
+    "agreement": "主谓一致 / 单复数",
+    "word_choice": "用词更地道",
+    "collocation": "固定搭配",
+    "chinglish": "别逐字直译",
+    "pronunciation": "明显发音错误",
+    "fluency": "少啰嗦、少填充词",
+}
+
+
+@dataclass
+class ReviewHabitRow:
+    """归纳出的一类反复出现的问题。"""
+
+    id: Optional[int] = None
+    user_id: int = 0
+    habit: str = "grammar"
+    title: str = ""
+    advice: Optional[str] = None
+    occurrences: int = 0
+    first_seen: Optional[str] = None
+    last_seen: Optional[str] = None
+    mastered: bool = False
+    mastered_at: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    @property
+    def label(self) -> str:
+        """中文标签，未知类型回退到原始值而不是显示空白。"""
+        return HABIT_LABELS.get(self.habit, self.habit)
+
+
+@dataclass
+class ReviewItem:
+    """一条要复习的具体说法（通常是一组固定搭配）。"""
+
+    id: Optional[int] = None
+    user_id: int = 0
+    habit_id: Optional[int] = None
+    dedup_key: str = ""
+    original: str = ""
+    suggestion: str = ""
+    note: Optional[str] = None
+    collocation: Optional[str] = None
+    occurrences: int = 0
+    first_seen: Optional[str] = None
+    last_seen: Optional[str] = None
+    mastered: bool = False
+    mastered_at: Optional[str] = None
+    source_session_id: Optional[int] = None
+    created_at: str = ""
+    updated_at: str = ""

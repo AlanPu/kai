@@ -34,6 +34,7 @@ from ..services.plancache import plan_cache
 from ..services.cost import estimate_cost, format_usage, parse_realtime_usage
 from ..services.profile import (INJECT_MIN_CONFIDENCE, ProfileExtractor,
                                 ProfileStore)
+from ..services.review import ReviewBuilder
 from ..services.session import ConversationSession
 from ..services.users import (DuplicateUser, InvalidUser, UserNotFound,
                               UserStore, quality_label)
@@ -602,6 +603,113 @@ async def export_profile(user: Optional[int] = None):
     except Exception as e:
         raise HTTPException(500, f"导出失败：{e}")
     return {"path": str(p), "text": p.read_text(encoding="utf-8")}
+
+
+# ============================================================
+#  复习：反复犯的问题
+#
+#  与「历史」的区别：历史是流水账（每一次练习），
+#  复习是归纳（我老是犯哪几类错、哪几个说法总说不对）。
+# ============================================================
+
+@app.get("/api/review")
+async def get_review(user: Optional[int] = None,
+                     include_mastered: bool = False):
+    """
+    该用户的复习清单：分类问题 + 每条下面的具体说法。
+
+    结构按「类型 → 条目」组织，因为用户复习时想知道的是
+    "我在哪一类上老出错"，而不只是零散句子。
+    """
+    u = _resolve_user(user)
+    if u is None:
+        return {"counts": {"habits": 0, "items": 0, "mastered": 0,
+                           "occurrences": 0},
+                "habits": [], "no_user": True}
+
+    habits = db().list_review_habits(u.id, include_mastered=include_mastered)
+    items = db().list_review_items(u.id, include_mastered=include_mastered)
+
+    by_habit: dict[int, list] = {}
+    for it in items:
+        by_habit.setdefault(it.habit_id, []).append(it)
+
+    def item_json(it):
+        return {
+            "id": it.id, "original": it.original,
+            "suggestion": it.suggestion, "note": it.note,
+            "collocation": it.collocation,
+            "occurrences": it.occurrences,
+            "first_seen": it.first_seen, "last_seen": it.last_seen,
+            "mastered": it.mastered,
+        }
+
+    return {
+        "user_id": u.id,
+        "counts": db().count_review(u.id),
+        "habits": [{
+            "id": h.id, "habit": h.habit, "label": h.label,
+            "title": h.title, "advice": h.advice,
+            "occurrences": h.occurrences,
+            "first_seen": h.first_seen, "last_seen": h.last_seen,
+            "mastered": h.mastered,
+            "items": [item_json(i) for i in by_habit.get(h.id, [])],
+        } for h in habits],
+    }
+
+
+class MasteredIn(BaseModel):
+    mastered: bool = True
+
+
+@app.post("/api/review/habits/{habit_id}/mastered")
+async def mark_habit(habit_id: int, body: MasteredIn,
+                     user: Optional[int] = None):
+    """把一类问题标记为「已改掉」（或取消）。"""
+    u = _require_user(user)
+    n = db().set_review_mastered(u.id, habit_id=habit_id,
+                                 mastered=body.mastered)
+    if not n:
+        raise HTTPException(404, "没有这条复习记录")
+    return {"ok": True, "counts": db().count_review(u.id)}
+
+
+@app.post("/api/review/items/{item_id}/mastered")
+async def mark_item(item_id: int, body: MasteredIn,
+                    user: Optional[int] = None):
+    """把一条具体说法标记为「已掌握」（或取消）。"""
+    u = _require_user(user)
+    n = db().set_review_mastered(u.id, item_id=item_id,
+                                 mastered=body.mastered)
+    if not n:
+        raise HTTPException(404, "没有这条复习记录")
+    return {"ok": True, "counts": db().count_review(u.id)}
+
+
+class RebuildIn(BaseModel):
+    reset: bool = True
+    min_occurrences: int = 2
+
+
+@app.post("/api/review/rebuild")
+async def rebuild_review(body: RebuildIn, user: Optional[int] = None):
+    """
+    按当前历史纠错重新归纳复习清单。
+
+    reset 默认 True：重建就该是重建。增量模式会把同一批历史
+    错误重复计数，次数虚高（次数是复习优先级，虚高会误导）。
+    """
+    u = _require_user(user)
+    try:
+        result = await asyncio.to_thread(
+            ReviewBuilder(db()).build, u.id,
+            reset=body.reset,
+            min_occurrences=max(1, body.min_occurrences))
+    except Exception as e:
+        raise HTTPException(500, f"归纳失败：{e}")
+    # 归纳结果要立刻反映到界面上，所以顺手把清单一起返回，
+    # 省掉前端再发一次请求（也避免两次读之间状态不一致）。
+    return {"ok": True, **result}
 
 
 # ============================================================

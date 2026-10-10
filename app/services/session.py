@@ -29,6 +29,7 @@ from ..storage.models import Correction, Turn
 from .corrector import Corrector
 from .plancache import plan_cache
 from .profile import ProfileExtractor, ProfileStore
+from .review import ReviewBuilder
 
 log = logging.getLogger(__name__)
 
@@ -247,6 +248,19 @@ class ConversationSession:
                                    duration_sec=elapsed, usage=usage)
         except Exception as e:
             log.error("会话收尾落库失败: %s", e)
+
+        # 把这次的新纠错并进复习清单。
+        #
+        # 增量（reset=False）：保留用户已经打过勾的「已掌握」，
+        # 否则每练一次，复习进度就被清空一次。
+        #
+        # 放在最后且单独 try：归纳失败绝不能影响会话收尾 ——
+        # 报告已经发出去了，这里出错最多是复习页少更新一次。
+        try:
+            await asyncio.to_thread(ReviewBuilder(self.db).build,
+                                    self.user_id, reset=False)
+        except Exception as e:
+            log.warning("复习清单更新失败: %s", e)
 
     # ---------- 音频输入 ----------
 

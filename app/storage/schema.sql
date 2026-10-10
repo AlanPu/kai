@@ -165,3 +165,108 @@ CREATE TABLE IF NOT EXISTS profile_facts (
 
 CREATE INDEX IF NOT EXISTS idx_profile_category
     ON profile_facts(user_id, category, confidence DESC);
+
+
+-- ============================================================
+--  复习：反复犯的问题
+--
+--  为什么不能只看 corrections：
+--    corrections 里是"这一次说错了什么"。用户真正需要复习的
+--    是"我老是犯哪几类错"。同一句 "I went to the." 在库里出现
+--    了 7 次，每次都是一条独立记录 —— 分散在各次会话里，
+--    既看不出重复，也没有地方集中翻看。
+--
+--  分两层：
+--    review_habits —— 归纳出的**问题类型**（如"句子说一半"），
+--                     带累计次数，用于发现反复性
+--    review_items  —— 挂在类型下的**具体固定说法**（如
+--                     "one at a time"），这才是真正要背的东西
+-- ============================================================
+CREATE TABLE IF NOT EXISTS review_habits (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+    -- 问题类型。用受控词表而非自由文本：这是聚合的分组键，
+    -- 模型每次自由发挥会导致同类问题被拆成好几组，统计就废了。
+    --   fragment      句子说不完整（中途卡住 / 缺成分）
+    --   duplication   重复词、重启（"use use"）
+    --   missing_subject 漏主语
+    --   tense         时态
+    --   article       冠词（a/an/the）
+    --   preposition   介词
+    --   agreement     主谓一致 / 单复数
+    --   word_choice   用词不地道
+    --   collocation   固定搭配 / 固定说法
+    --   chinglish     中式直译
+    --   pronunciation 明显发音错误
+    --   fluency       啰嗦、填充词
+    habit       TEXT    NOT NULL,
+
+    -- 一句话说明这类问题的表现（中文，给人看）
+    title       TEXT    NOT NULL,
+    -- 为什么错 / 怎么改（中文）
+    advice      TEXT,
+
+    -- 累计出现次数：复习的优先级就看它
+    occurrences INTEGER NOT NULL DEFAULT 0,
+    -- 首次 / 最近出现，用于显示"这个问题跟了我多久"
+    first_seen  TEXT,
+    last_seen   TEXT,
+
+    -- 用户主动标记"已经改掉了"，之后不再出现在待复习里
+    mastered    INTEGER NOT NULL DEFAULT 0,
+    mastered_at TEXT,
+
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+
+    -- 一个用户同一类问题只有一行，再出现时累加 occurrences
+    UNIQUE (user_id, habit)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_habits_user
+    ON review_habits(user_id, mastered, occurrences DESC);
+
+
+-- 具体条目：一条"固定说法"或一个例句对
+--
+-- 这条表承载用户明确的需求："常用的固定说法、固定搭配"。
+-- original → suggestion 就是复习时最该盯住的一对。
+CREATE TABLE IF NOT EXISTS review_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    habit_id    INTEGER REFERENCES review_habits(id) ON DELETE CASCADE,
+
+    -- 规范化去重键：原句去掉大小写/标点/多余空格后的指纹。
+    -- 没有它，"I went to the." 会重复插入 7 次，
+    -- 复习清单就被同一句话刷屏了（真实数据里就是这样）。
+    dedup_key   TEXT    NOT NULL,
+
+    original    TEXT    NOT NULL,   -- 我当时的说法（错的/不地道的）
+    suggestion  TEXT    NOT NULL,   -- 应该这样说
+    note        TEXT,               -- 中文说明（可空）
+
+    -- 固定搭配单独抽出来，复习时可以只看这一列
+    -- （如 "one ... at a time"）。没有则空。
+    collocation TEXT,
+
+    occurrences INTEGER NOT NULL DEFAULT 0,
+    first_seen  TEXT,
+    last_seen   TEXT,
+
+    mastered    INTEGER NOT NULL DEFAULT 0,
+    mastered_at TEXT,
+
+    -- 来源会话，便于回到当时的上下文
+    source_session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+
+    UNIQUE (user_id, dedup_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_items_user
+    ON review_items(user_id, mastered, occurrences DESC);
+CREATE INDEX IF NOT EXISTS idx_review_items_habit
+    ON review_items(habit_id);
