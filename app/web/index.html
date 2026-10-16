@@ -118,6 +118,24 @@ h1{font-size:19px;margin:0;font-weight:600}
 .urow .sub{font-size:12px;color:var(--dim)}
 .urow .spacer{flex:1}
 .urow .del{color:#f87171;font-size:12px;padding:3px 7px}
+.urow .redo{font-size:12px;padding:3px 7px}
+
+/* 历史列表：每条就是一份"小报告"，点开看全文 */
+.hlist{display:flex;flex-direction:column;gap:9px;margin-top:12px}
+.hrow{border:1px solid var(--line);border-radius:9px;padding:10px 12px;
+      cursor:pointer;background:var(--panel2)}
+.hrow:hover{border-color:#555}
+.hrow .htop{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.hrow .hid{color:var(--dim);font-size:12px}
+.hrow .hwhen{color:var(--dim);font-size:12px}
+.hrow .htitle{font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;
+      white-space:nowrap}
+.hrow .hstats{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;
+      color:var(--dim)}
+.hrow .hstats b{color:var(--fg);font-weight:600}
+.hrow .hcost{color:var(--warn)}
+.hrow .bad{color:var(--err);font-size:11px;border:1px solid var(--line);
+      border-radius:5px;padding:1px 5px}
 
 /* 录入向导 */
 .enroll-prog{display:flex;gap:5px;margin:12px 0}
@@ -235,7 +253,7 @@ h1{font-size:19px;margin:0;font-weight:600}
 
   <section id="report" class="hidden">
     <div class="card">
-      <h2>练习报告</h2>
+      <h2 id="reportTitle">练习报告</h2>
       <div id="reportBody"></div>
       <div class="ctrls" style="margin-top:16px">
         <button id="btnAgain">再练一次</button>
@@ -371,6 +389,20 @@ h1{font-size:19px;margin:0;font-weight:600}
       <button class="ghost" id="btnEnrollRedo">重录这句</button>
       <div class="spacer"></div>
       <button class="ghost" id="btnEnrollCancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="historyModal" class="hidden"
+     style="position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:60;
+            display:flex;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="max-width:640px;width:100%;max-height:85vh;
+       overflow:auto">
+    <h2>练习历史</h2>
+    <div class="hint" id="histHead"></div>
+    <div class="hlist" id="histList"></div>
+    <div class="ctrls" style="margin-top:14px">
+      <button class="ghost" id="btnCloseHist">关闭</button>
     </div>
   </div>
 </div>
@@ -973,6 +1005,11 @@ function showReport(r) {
   $("report").classList.remove("hidden");
   if (!r) { $("reportBody").textContent = "（报告不可用）"; return; }
 
+  // 从历史点进来的报告要标明是哪一次，否则标题写着"练习报告"、
+  // 下面又是"再练一次"，会让人以为这是刚练完那次的结果。
+  $("reportTitle").textContent = "练习报告"
+    + (r.id ? " — 第 " + r.id + " 次" : "");
+
   const ratio = Math.round((r.user_ratio || 0) * 100);
   let html =
     '<div class="stat"><span>时长</span><b>' + fmt(r.duration_sec) + '</b></div>'
@@ -981,8 +1018,7 @@ function showReport(r) {
     + '<div class="stat"><span>AI 说话</span><b>' + (r.ai_char_count || 0)
     + ' 字</b></div>'
     + '<div class="stat"><span>我占比</span><b style="color:'
-    + (ratio >= 55 ? "var(--ok)" : ratio >= 40 ? "var(--warn)" : "var(--err)")
-    + '">' + ratio + '%</b></div>';
+    + ratioColor(ratio) + '">' + ratio + '%</b></div>';
 
   if (ratio < 40) {
     html += '<p class="hint">这次 AI 说得偏多。下次可以就一个话题多说几句。</p>';
@@ -992,7 +1028,11 @@ function showReport(r) {
     html += '<div class="stat"><span>用量</span><b>'
       + r.usage.total_tokens.toLocaleString() + ' tokens</b></div>'
       + '<div class="stat"><span>费用（估算）</span><b>约 '
-      + r.usage.cost_yuan.toFixed(3) + ' 元</b></div>';
+      + fmtCost(r.usage.cost_yuan) + '</b></div>'
+      // 说明口径：只给一个很小的数字，用户会怀疑是不是漏算了。
+      // 与其让人猜，不如写清这是按对话 token 折的估算。
+      + '<p class="hint">费用按对话用量（token）估算，不含备课、纠错等'
+      + '文本调用；实际以阿里云账单为准。</p>';
   }
 
   const cs = r.corrections || [];
@@ -1395,6 +1435,62 @@ $("btnReviewRebuild").onclick = async () => {
   }
 };
 
+// 历史上限。用户要的是"最近十次"，不是无限翻旧账。
+const HISTORY_LIMIT = 10;
+
+// 占比配色：和报告页同一套阈值，两处说法必须一致
+function ratioColor(ratio) {
+  return ratio >= 55 ? "var(--ok)" : ratio >= 40 ? "var(--warn)" : "var(--err)";
+}
+
+// 用文字说清"这次练得怎么样"，光看百分比不好判断
+function ratioWord(ratio) {
+  if (ratio >= 55) return "说得够多";
+  if (ratio >= 40) return "还可以";
+  return "AI 说得偏多";
+}
+
+function fmtCost(y) {
+  // 单次练习常常只有几厘钱，toFixed(2) 会一律显示 0.00 —— 看着像没花钱。
+  // 小额给三位小数，让人看得见确实产生了费用。
+  const v = Number(y || 0);
+  if (v === 0) return "0 元";
+  if (v < 0.01) return v.toFixed(3) + " 元";
+  return v.toFixed(2) + " 元";
+}
+
+function renderHistoryRow(s) {
+  const ratio = Math.round((s.user_ratio || 0) * 100);
+  const when = String(s.started_at || "").slice(5, 16).replace("T", " ");
+  const title = String(s.title || "（无标题）").slice(0, 40);
+  const st = s.status === "finished" ? ""
+    : '<span class="bad">' + (s.status === "aborted" ? "中断" : "未完成") + "</span>";
+
+  let stats = '<span>时长 <b>'
+    + (s.duration_sec ? fmt(s.duration_sec) : "—") + "</b></span>"
+    + "<span>我 <b>" + (s.user_char_count || 0) + "</b> 字</span>"
+    + "<span>AI <b>" + (s.ai_char_count || 0) + "</b> 字</span>"
+    + '<span>我占比 <b style="color:' + ratioColor(ratio) + '">'
+    + ratio + "%</b></span>"
+    + "<span>" + (s.turn_count || 0) + " 轮</span>";
+
+  if (s.usage && s.usage.total_tokens) {
+    stats += "<span>用量 <b>" + s.usage.total_tokens.toLocaleString()
+      + "</b> tokens</span>"
+      + '<span class="hcost">约 ' + fmtCost(s.usage.cost_yuan) + "</span>";
+  } else {
+    // 没数据就说没数据。不显示"0 元"——那会被读成"这次没花钱"。
+    stats += '<span class="hcost">用量未记录</span>';
+  }
+
+  return '<div class="hrow" data-sid="' + s.id + '">'
+    + '<div class="htop"><span class="hid">#' + s.id + '</span>'
+    + '<span class="hwhen">' + esc(when) + '</span>'
+    + '<span class="htitle">' + esc(title) + '</span>' + st + '</div>'
+    + '<div class="hstats">' + stats + '</div>'
+    + "</div>";
+}
+
 $("btnHistory").onclick = async () => {
   // 失败必须说出来。原来这里没有任何 try/catch：只要 stats 挂了，
   // 整个函数静默抛出，界面表现就是「点了没反应」——
@@ -1402,7 +1498,8 @@ $("btnHistory").onclick = async () => {
   let d, st;
   try {
     const [rr, rs] = await Promise.all([
-      fetch(api("/api/sessions?limit=20")), fetch(api("/api/stats"))]);
+      fetch(api("/api/sessions?limit=" + HISTORY_LIMIT)),
+      fetch(api("/api/stats"))]);
     if (!rr.ok || !rs.ok) {
       throw new Error("sessions=" + rr.status + " stats=" + rs.status);
     }
@@ -1414,16 +1511,40 @@ $("btnHistory").onclick = async () => {
     return;
   }
   if (!d.sessions || !d.sessions.length) { toast("还没有练习记录"); return; }
-  const head = "累计 " + st.finished + " 次练习 · " + st.total_minutes
-    + " 分钟 · 约 " + st.cost_yuan.toFixed(2) + " 元 · 记住 "
-    + st.facts_learned + " 条信息\n"
-    + "平均我说话占 " + Math.round((st.user_ratio || 0) * 100) + "%";
-  const lines = d.sessions.map(s => "#" + s.id + "  "
-    + String(s.started_at || "").slice(5, 16) + "  "
-    + (s.duration_sec ? fmt(s.duration_sec) : "—") + "  "
-    + (s.turn_count || 0) + "轮  " + String(s.title || "").slice(0, 26));
-  alert(head + "\n\n最近的练习：\n\n" + lines.join("\n"));
+
+  $("histHead").innerHTML = "累计 <b>" + st.finished + "</b> 次练习 · "
+    + st.total_minutes + " 分钟 · 约 " + fmtCost(st.cost_yuan)
+    + " · 记住 " + st.facts_learned + " 条信息 · 平均我说话占 "
+    + Math.round((st.user_ratio || 0) * 100) + "%"
+    + '<br>下面是最近 ' + d.sessions.length + " 次，点任意一条看完整报告。";
+
+  $("histList").innerHTML = d.sessions.map(renderHistoryRow).join("");
+  $("histList").querySelectorAll(".hrow").forEach(row => {
+    row.onclick = () => openSessionReport(Number(row.dataset.sid));
+  });
+  $("historyModal").classList.remove("hidden");
 };
+
+$("btnCloseHist").onclick = () => $("historyModal").classList.add("hidden");
+$("historyModal").onclick = e => {
+  if (e.target === $("historyModal")) $("historyModal").classList.add("hidden");
+};
+
+// 点历史里的一条 → 拉该次的完整报告并复用报告页渲染。
+// 复用 showReport 而不是另写一套，避免"历史里的报告"和
+// "刚练完的报告"长得不一样，也免得同一套统计逻辑维护两遍。
+async function openSessionReport(sid) {
+  try {
+    const r = await fetch("/api/sessions/" + sid);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const rep = await r.json();
+    $("historyModal").classList.add("hidden");
+    showReport(rep);
+  } catch (err) {
+    console.error("[历史] 报告读取失败", err);
+    toast("读取这次报告失败：" + (err && err.message ? err.message : err));
+  }
+}
 
 // ============================================================
 //  用户：切换、新建、删除
@@ -1470,12 +1591,17 @@ function renderUserList(users) {
     + '<div class="sub">声纹：' + esc(u.voiceprint_quality_label)
     + (u.has_voiceprint ? " · " + (u.voiceprint_samples || 0) + " 句" : "")
     + '</div></span><span class="spacer"></span>'
+    // 已有声纹才给「重录」：没录过的用户走下面的"点这里录入"，
+    // 两个入口同时出现会让人以为是两件不同的事。
+    + (u.has_voiceprint
+        ? '<button class="ghost redo" data-redo="' + u.id + '">重录声纹</button>'
+        : '')
     + '<button class="ghost del" data-del="' + u.id + '">删除</button>'
     + '</div>').join("");
 
   box.querySelectorAll(".urow").forEach(row => {
     row.onclick = async e => {
-      if (e.target.dataset.del) return;
+      if (e.target.dataset.del || e.target.dataset.redo) return;
       const id = Number(row.dataset.id);
       const u = users.find(x => x.id === id);
       if (!u) return;
@@ -1498,6 +1624,24 @@ function renderUserList(users) {
       } else {
         $("userHint").textContent = "声纹质量：" + u.voiceprint_quality_label;
       }
+    };
+  });
+
+  box.querySelectorAll("[data-redo]").forEach(b => {
+    b.onclick = async e => {
+      e.stopPropagation();
+      const id = Number(b.dataset.redo);
+      const u = users.find(x => x.id === id);
+      if (!u) return;
+
+      // 直接进录入流程，**不先删旧声纹**：
+      // 旧声纹是"取消重录/录到一半失败"时的安全网 —— 先删再录，
+      // 中途退出就会变成"既没新声纹也没旧声纹"，练习时静默不过滤。
+      // 服务端保存走临时文件 + 原子替换，录完自然覆盖旧的。
+      me = u;
+      localStorage.setItem("kai_user", u.id);
+      renderUserChip(); renderUserList(users);
+      openEnroll();
     };
   });
 
@@ -1697,7 +1841,15 @@ async function openEnroll() {
 
   $("userModal").classList.add("hidden");
   $("enrollModal").classList.remove("hidden");
-  $("enrollTitle").textContent = "录入声纹 — " + me.name;
+  // 重录和首次录入共用这个弹窗。文案要分开说，否则重录的人会以为
+  // 旧声纹已经被清掉、中途退出就没得用了（实际并不会）。
+  const redo = !!(me && me.has_voiceprint);
+  $("enrollTitle").textContent = (redo ? "重录声纹 — " : "录入声纹 — ") + me.name;
+  $("enrollIntro").textContent = redo
+    ? "请戴上平时说话用的耳机/麦克风，用同样的音量和距离重读。"
+      + "录满并保存前，原来的声纹继续有效 —— 中途取消不会丢。"
+    : "请用平时说话的音量和距离，自然地读出下面这句话。"
+      + "录 3 句以上即可，录得越多越准。";
   $("enrollSay").textContent = "准备中…";
   $("enrollHint").textContent = "";
   $("enrollStatus").textContent = "";

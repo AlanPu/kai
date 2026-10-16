@@ -7,6 +7,7 @@
 """
 
 import json
+import re
 from urllib.parse import quote_plus
 from pathlib import Path
 
@@ -735,6 +736,61 @@ def test_frontend_enroll_commands_use_type_field():
         assert "cmd:" not in s, f"前端不应使用 cmd 字段，实际: {s}"
 
 
+def test_frontend_has_reenroll_button_for_existing_voiceprint():
+    """
+    已有声纹的用户必须能在界面上重录。
+
+    换麦克风/耳机是头号场景，而重录入口曾经只存在于
+    `if (!u.has_voiceprint)` 分支里 —— 恰好把最需要它的人挡在外面：
+    已经有声纹的用户点用户名只能看到「删除」，而删除会连画像和
+    历史一起清掉，不能当成重录用。
+    """
+    import re
+    from pathlib import Path
+
+    html = (Path(__file__).resolve().parent.parent
+            / "app" / "web" / "index.html").read_text(encoding="utf-8")
+
+    # 按钮只在 has_voiceprint 为真时出现，且带 data-redo 供事件绑定
+    m = re.search(r"u\.has_voiceprint\s*\n?\s*\?\s*'<button[^']*data-redo=", html)
+    assert m, "用户列表里没有「重录声纹」按钮，或它没有挂在 has_voiceprint 上"
+
+    assert re.search(r'querySelectorAll\("\[data-redo\]"\)', html), \
+        "有 data-redo 按钮但没有绑定点击事件"
+    assert re.search(r"e\.target\.dataset\.del \|\| e\.target\.dataset\.redo",
+                     html), \
+        "行的 onclick 没有排除 data-redo，点重录会同时触发「切换用户」"
+    assert "openEnroll()" in html.split("[data-redo]")[1][:800], \
+        "点「重录声纹」后没有进入录入流程"
+
+
+def test_reenroll_does_not_delete_old_voiceprint_first():
+    """
+    重录**不能**先删旧声纹。
+
+    旧声纹是"取消重录 / 录到一半失败"时的安全网。先删再录，
+    中途退出就会变成既没新声纹也没旧声纹，练习时静默不做过滤 ——
+    正是 SETUP.md 想避免的那种"不知道为什么外人说话 AI 也回"。
+    服务端 save_voiceprint 走临时文件 + replace，录完自然覆盖。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "app" / "web" / "index.html").read_text(encoding="utf-8")
+
+    redo_block = html.split("[data-redo]")[1][:900]
+    assert "DELETE" not in redo_block and "delete_voiceprint" not in redo_block, \
+        "重录入口里出现了删除声纹的调用 —— 中途取消会丢失旧声纹"
+
+    # 后端保存必须是原子替换，否则崩溃会留下半个声纹文件
+    users_src = (root / "app" / "services" / "users.py").read_text(
+        encoding="utf-8")
+    save = users_src.split("def save_voiceprint")[1].split("def ")[0]
+    assert "tmp.replace(p)" in save or "os.replace" in save, \
+        "save_voiceprint 不是原子替换，重录中途崩溃会损坏声纹文件"
+
+
 def test_speech_stopped_helper_exists_and_matches_event():
     """必须有识别「用户说完」的辅助函数。
 
@@ -1355,6 +1411,192 @@ def test_history_button_reports_failure():
     assert ".ok" in body, \
         "必须检查 response.ok —— 只 await .json() 会把 500 当成正常响应"
     assert "toast(" in body, "失败要 toast 告诉用户，而不是只 console.error"
+
+
+# ============================================================
+#  历史列表：汇总信息
+#
+#  用户要的是"最近几次练得怎么样"，所以历史列表每条都要带上
+#  报告页那套汇总（时长/字数/占比/用量/费用），点开看全文。
+# ============================================================
+
+def test_history_default_limit_is_ten():
+    """用户明确要「保存最近 10 条历史记录」。
+
+    以前写死 20 —— 列表越长越像流水账，而用户要的是对近期
+    练习的回顾。
+    """
+    src = _web_code()
+    m = re.search(r"HISTORY_LIMIT\s*=\s*(\d+)", src)
+    assert m, "前端应有 HISTORY_LIMIT 常量，别把条数散落在字符串里"
+    assert int(m.group(1)) == 10, f"历史条数应为 10，实际 {m.group(1)}"
+
+    body = src[src.index('$("btnHistory").onclick'):]
+    assert "HISTORY_LIMIT" in body, \
+        "请求历史时必须用 HISTORY_LIMIT，否则改了常量也不生效"
+
+
+def test_history_list_shows_summary_not_alert():
+    """历史必须是可读的列表，不能再用 alert 弹一串纯文本。
+
+    alert 里塞不下用量/费用，也没法点开看详情 ——
+    这正是用户提这次需求的原因。
+    """
+    src = _web_code()
+    body = src[src.index('$("btnHistory").onclick'):]
+    body = body[:body.index("\n};")]
+    assert "alert(" not in body, \
+        "历史不该再用 alert —— 它是这次要替换掉的老实现"
+    assert "historyModal" in body, "历史要渲染进弹窗"
+
+
+def test_history_row_shows_duration_chars_ratio_and_cost():
+    """每一行都必须体现报告里的汇总信息。"""
+    src = _web_code()
+    assert "function renderHistoryRow" in src, "缺少历史行渲染函数"
+    fn = src[src.index("function renderHistoryRow"):]
+    fn = fn[:fn.index("\n}")]
+
+    for field, why in [
+        ("duration_sec", "时长"),
+        ("user_char_count", "我说话字数"),
+        ("ai_char_count", "AI 说话字数"),
+        ("user_ratio", "我的占比"),
+        ("total_tokens", "用量"),
+        ("cost_yuan", "费用"),
+    ]:
+        assert field in fn, f"历史行没有体现「{why}」（缺 {field}）"
+
+
+def test_history_row_says_unknown_instead_of_zero_cost():
+    """没有用量数据时不能说"0 元"。
+
+    老会话（或存坏的 JSON）没有 usage_json。显示 0 元会被读成
+    "这次没花钱"，而事实是"没记录" —— 两回事。
+    """
+    src = _web_code()
+    fn = src[src.index("function renderHistoryRow"):]
+    fn = fn[:fn.index("\n}")]
+    assert "用量未记录" in fn, \
+        "缺用量时要明确写「用量未记录」，不能退化成 0"
+
+
+def test_small_cost_does_not_round_to_zero():
+    """单次练习常常只有几厘钱，toFixed(2) 会一律显示 0.00。
+
+    实测：一条会话 2180 tokens ≈ 0.002 元。用两位小数看就是
+    "0.00 元"，像没花钱。
+    """
+    src = _web_code()
+    assert "function fmtCost" in src, "缺少费用格式化函数"
+    fn = src[src.index("function fmtCost"):]
+    fn = fn[:fn.index("\n}")]
+    assert "toFixed(3)" in fn, \
+        "小额费用要用三位小数，否则真实花费显示成 0.00"
+
+
+def test_report_and_history_share_ratio_coloring():
+    """报告页和历史列表的占比配色必须来自同一个函数。
+
+    两处各写一套阈值，迟早出现"列表说是绿的、点进去是黄的"。
+    """
+    src = _web_code()
+    assert "function ratioColor" in src
+    report = src[src.index("function showReport"):]
+    report = report[:report.index("\n}")]
+    assert "ratioColor(" in report, \
+        "报告页应复用 ratioColor，不要内联三元表达式"
+
+
+def test_history_row_click_opens_full_report():
+    """点历史里的一条 → 拉那次的完整报告。"""
+    src = _web_code()
+    assert "function openSessionReport" in src, "缺少打开历史报告的函数"
+    fn = src[src.index("function openSessionReport"):]
+    fn = fn[:fn.index("\n}")]
+    assert "/api/sessions/" in fn, "要按 id 拉单次报告"
+    assert ".ok" in fn, "必须检查 response.ok，否则 404 会被当成正常"
+    assert "showReport(" in fn, \
+        "应复用 showReport 渲染，避免和「刚练完的报告」长得不一样"
+
+    body = src[src.index('$("btnHistory").onclick'):]
+    assert "openSessionReport(" in body, "历史行没有绑定点击"
+
+
+def test_report_title_marks_which_session():
+    """从历史点进来的报告要标明是哪一次。
+
+    标题只写"练习报告"、下面又有"再练一次"，会让人以为
+    这是刚结束那次的结果。
+    """
+    src = _web_code()
+    report = src[src.index("function showReport"):]
+    report = report[:report.index("\n}")]
+    assert "reportTitle" in report, \
+        "showReport 应设置 reportTitle，标出这次是第几次"
+
+
+def test_backend_list_sessions_includes_summary_fields():
+    """后端 /api/sessions 必须返回汇总字段，前端才不用逐条再查。"""
+    import inspect
+
+    from app.api import server
+
+    src = inspect.getsource(server.list_sessions)
+    for field in ["user_ratio", "usage"]:
+        assert field in src, f"/api/sessions 缺少 {field}"
+
+    # 共用摘要函数：列表和报告算出来的数字必须同源
+    helper = inspect.getsource(server._usage_summary)
+    assert "parse_realtime_usage" in helper
+    assert "estimate_cost" in helper
+
+    report_src = inspect.getsource(server._build_report)
+    assert "_usage_summary" in report_src, \
+        "报告页也要用 _usage_summary，否则两处口径会漂移"
+    assert "_ratio" in report_src, \
+        "报告页的占比也要用 _ratio，避免两处算不一致"
+
+
+def test_usage_summary_handles_broken_json():
+    """存坏的 usage_json 不能让整个历史列表 500。
+
+    一条坏数据不该让用户看不到其他 9 条记录。
+    """
+    from app.api.server import _usage_summary
+
+    assert _usage_summary(None) is None
+    assert _usage_summary("") is None
+    assert _usage_summary("{ 这不是 json") is None
+    assert _usage_summary('{"unexpected": "shape"}') is None
+
+    ok = _usage_summary(json.dumps({
+        "total_tokens": 712, "input_tokens": 695, "output_tokens": 17,
+        "input_tokens_details": {"text_tokens": 695},
+        "output_tokens_details": {"text_tokens": 5, "audio_tokens": 12},
+    }))
+    assert ok and ok["total_tokens"] == 712
+    assert ok["cost_yuan"] > 0
+
+
+def test_ratio_helper_avoids_division_by_zero():
+    from app.api.server import _ratio
+
+    assert _ratio(0, 0) == 0
+    assert _ratio(None, None) == 0
+    assert _ratio(30, 70) == 0.3
+    assert _ratio(1, 0) == 1.0
+
+
+def test_list_sessions_clamps_limit():
+    """limit 要夹在合理区间，避免有人传 0 或巨大值。"""
+    import inspect
+
+    from app.api import server
+
+    src = inspect.getsource(server.list_sessions)
+    assert "min(limit" in src and "max(1" in src, \
+        "limit 应夹在 [1, 100]，否则 limit=0 返回空、limit=99999 拖库"
 
 
 def test_frontend_binds_c_key_to_prompt():

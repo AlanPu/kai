@@ -501,8 +501,46 @@ async def prepare(body: PrepareIn, user: Optional[int] = None):
 #  历史与报告
 # ============================================================
 
+def _usage_summary(usage_json: Optional[str]) -> Optional[dict]:
+    """
+    把落库的 usage_json 变成给界面用的用量/费用摘要。
+
+    抽成函数是因为「历史列表」和「单次报告」都要显示同一组数字 ——
+    两处各写一遍迟早会漂移，出现"列表说 0.12 元、点进去说 0.15 元"。
+    列表页一次要算 10 条，所以这里必须便宜：纯解析，不查库。
+    """
+    if not usage_json:
+        return None
+    try:
+        u = parse_realtime_usage(json.loads(usage_json))
+    except Exception:
+        # 存坏的 JSON 不该让整个历史列表 500 —— 只是这一条没有用量
+        return None
+    if not u.total_tokens:
+        return None
+    return {
+        "total_tokens": u.total_tokens,
+        "text": format_usage(u),
+        "cost_yuan": estimate_cost(u),
+    }
+
+
+def _ratio(user_chars: Optional[int], ai_chars: Optional[int]) -> float:
+    """用户字数占比。两边都是 0 时返回 0 而不是除零。"""
+    total = (user_chars or 0) + (ai_chars or 0)
+    return round((user_chars or 0) / total, 3) if total else 0
+
+
 @app.get("/api/sessions")
 async def list_sessions(limit: int = 30, user: Optional[int] = None):
+    """
+    历史列表。
+
+    默认 10 条：用户要的是"最近几次练得怎么样"，不是翻流水账。
+    每条都带上和报告页同一套汇总（占比、用量、费用），
+    这样历史列表本身就是一份可扫读的小报告，点进去才是全文。
+    """
+    limit = max(1, min(limit, 100))
     u = _resolve_user(user)
     if u is None:
         return {"sessions": []}
@@ -514,7 +552,11 @@ async def list_sessions(limit: int = 30, user: Optional[int] = None):
             "title": s.input_title or (s.input_raw or "")[:60],
             "duration_sec": s.duration_sec, "turn_count": s.turn_count,
             "user_char_count": s.user_char_count,
-            "ai_char_count": s.ai_char_count, "status": s.status,
+            "ai_char_count": s.ai_char_count,
+            "user_ratio": _ratio(s.user_char_count, s.ai_char_count),
+            "status": s.status,
+            # 和报告页共用同一个摘要函数，数字不会两处不一致
+            "usage": _usage_summary(s.usage_json),
         })
     return {"sessions": out}
 
@@ -542,31 +584,16 @@ def _build_report(session_id: int) -> Optional[dict]:
         "word": c.word, "phonetic": c.phonetic,
     } for c in db().list_corrections(session_id)]
 
-    total = (s.user_char_count or 0) + (s.ai_char_count or 0)
-
-    # 费用（用量在结束时存进 usage_json）
-    usage = None
-    if s.usage_json:
-        try:
-            import json as _json
-            usage = _json.loads(s.usage_json)
-        except Exception:
-            usage = None
-    u = parse_realtime_usage(usage)
-
     return {
         "id": s.id, "status": s.status, "duration_sec": s.duration_sec,
         "input_kind": s.input_kind, "title": s.input_title,
         "turn_count": s.turn_count,
         "user_char_count": s.user_char_count,
         "ai_char_count": s.ai_char_count,
-        "user_ratio": round(s.user_char_count / total, 3) if total else 0,
+        # 与历史列表共用，保证"列表里的占比"和"报告里的占比"是同一个数
+        "user_ratio": _ratio(s.user_char_count, s.ai_char_count),
         "turns": turns, "corrections": corrections,
-        "usage": {
-            "total_tokens": u.total_tokens,
-            "text": format_usage(u),
-            "cost_yuan": estimate_cost(u),
-        } if u.total_tokens else None,
+        "usage": _usage_summary(s.usage_json),
     }
 
 
