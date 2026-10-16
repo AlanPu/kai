@@ -1460,6 +1460,9 @@ function fmtCost(y) {
 }
 
 function renderHistoryRow(s) {
+  // 旧后端连字段都不返回。这种情况不能显示"0%"和"用量未记录" ——
+  // 那是把"后端版本旧"说成了"你的数据就是这样"，会让人去查数据库。
+  const stale = !Object.prototype.hasOwnProperty.call(s, "user_ratio");
   const ratio = Math.round((s.user_ratio || 0) * 100);
   const when = String(s.started_at || "").slice(5, 16).replace("T", " ");
   const title = String(s.title || "（无标题）").slice(0, 40);
@@ -1470,16 +1473,22 @@ function renderHistoryRow(s) {
     + (s.duration_sec ? fmt(s.duration_sec) : "—") + "</b></span>"
     + "<span>我 <b>" + (s.user_char_count || 0) + "</b> 字</span>"
     + "<span>AI <b>" + (s.ai_char_count || 0) + "</b> 字</span>"
-    + '<span>我占比 <b style="color:' + ratioColor(ratio) + '">'
-    + ratio + "%</b></span>"
+    + (stale
+        ? '<span class="hcost">占比不可用</span>'
+        : '<span>我占比 <b style="color:' + ratioColor(ratio) + '">'
+          + ratio + "%</b></span>")
     + "<span>" + (s.turn_count || 0) + " 轮</span>";
 
   if (s.usage && s.usage.total_tokens) {
     stats += "<span>用量 <b>" + s.usage.total_tokens.toLocaleString()
       + "</b> tokens</span>"
       + '<span class="hcost">约 ' + fmtCost(s.usage.cost_yuan) + "</span>";
+  } else if (stale) {
+    // 字段不存在 = 后端旧，别赖到数据头上
+    stats += '<span class="hcost">用量不可用（后端未重启）</span>';
   } else {
-    // 没数据就说没数据。不显示"0 元"——那会被读成"这次没花钱"。
+    // 字段存在但是 null：这次练习确实没记录用量。
+    // 不显示"0 元"——那会被读成"这次没花钱"。
     stats += '<span class="hcost">用量未记录</span>';
   }
 
@@ -1512,7 +1521,22 @@ $("btnHistory").onclick = async () => {
   }
   if (!d.sessions || !d.sessions.length) { toast("还没有练习记录"); return; }
 
-  $("histHead").innerHTML = "累计 <b>" + st.finished + "</b> 次练习 · "
+  // 旧后端（服务没重启）不会返回 user_ratio / usage 字段。
+  // 这时前端拿到的 undefined 会被兜底成"0% / 用量未记录"，
+  // 看起来像数据坏了 —— 实际是代码没生效。必须区分开：
+  //   字段「不存在」 = 后端版本旧，该重启服务
+  //   字段是 null    = 这次练习真的没记录用量
+  // 用 hasOwnProperty 判断"存在与否"，不能用 !s.usage，
+  // 那样两种情况的真假值一样，又混成一种显示了。
+  const stale = d.sessions.some(s =>
+    !Object.prototype.hasOwnProperty.call(s, "usage")
+    || !Object.prototype.hasOwnProperty.call(s, "user_ratio"));
+
+  $("histHead").innerHTML = (stale
+    ? '<b style="color:var(--err)">后端版本较旧，占比和用量无法显示 —— '
+      + '请重启服务（./start.sh）后刷新本页。</b><br>'
+    : "")
+    + "累计 <b>" + st.finished + "</b> 次练习 · "
     + st.total_minutes + " 分钟 · 约 " + fmtCost(st.cost_yuan)
     + " · 记住 " + st.facts_learned + " 条信息 · 平均我说话占 "
     + Math.round((st.user_ratio || 0) * 100) + "%"

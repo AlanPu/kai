@@ -1481,6 +1481,56 @@ def test_history_row_says_unknown_instead_of_zero_cost():
         "缺用量时要明确写「用量未记录」，不能退化成 0"
 
 
+def test_history_row_distinguishes_stale_backend_from_missing_data():
+    """必须能区分「后端版本旧」和「这次真没记录用量」。
+
+    真实踩坑：改完 /api/sessions 后忘了重启服务，界面显示
+    「占比 0% / 用量未记录」，看起来像数据坏了 —— 于是跑去查
+    数据库（数据完全正常），实际只是旧进程还在跑。
+
+    两种情况的真假值一样（都是 undefined→0、undefined→无），
+    靠 `!s.usage` 分不开，必须判断**字段是否存在**。
+    """
+    src = _web_code()
+    fn = src[src.index("function renderHistoryRow"):]
+    fn = fn[:fn.index("\n}")]
+
+    assert "hasOwnProperty" in fn, \
+        "要用 hasOwnProperty 判断字段是否存在 —— 用 !s.usage 会把" \
+        "「后端旧」和「真没数据」混成一种显示"
+    assert "不可用" in fn, \
+        "旧后端要写「不可用」之类的明确说法，不能显示成 0%"
+
+
+def test_history_head_warns_when_backend_is_stale():
+    """旧后端要在列表顶部明确提示重启服务。"""
+    src = _web_code()
+    body = src[src.index('$("btnHistory").onclick'):]
+    body = body[:body.index("\n};")]
+
+    assert "hasOwnProperty" in body, \
+        "顶部提示也要靠字段存在性判断，否则真没数据的老会话会误报"
+    assert "重启" in body, "要告诉用户具体怎么做（重启服务）"
+
+
+def test_stale_detection_does_not_false_positive_on_null_usage():
+    """有字段但为 null 时**不能**报"后端旧"。
+
+    老会话的 usage 是 null（字段存在）。如果拿 `!s.usage` 判断，
+    这些会话会被误报成"后端未重启" —— 而用户刚重启过，
+    会以为重启没生效，白折腾一轮。
+    """
+    # 用剥掉注释的版本：解释性注释里提到 !s.usage 不该让测试失败
+    # （这个坑在本文件里踩过一次，_web_code 就是为此存在的）
+    src = _web_code()
+    for start in ["function renderHistoryRow",
+                  '$("btnHistory").onclick']:
+        block = src[src.index(start):]
+        block = block[:block.index("\n}")]
+        assert "!s.usage" not in block and "!s.user_ratio" not in block, \
+            f"{start} 里不能用裸的 !字段 判断，会把 null 误判成旧后端"
+
+
 def test_small_cost_does_not_round_to_zero():
     """单次练习常常只有几厘钱，toFixed(2) 会一律显示 0.00。
 
