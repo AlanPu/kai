@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>英语口语陪练</title>
+<title>口语陪练</title>
 <style>
 :root{
   --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
@@ -18,9 +18,9 @@ button{font:inherit;cursor:pointer;border:0;border-radius:8px;
 button:hover{filter:brightness(1.1)}
 button:disabled{opacity:.45;cursor:not-allowed}
 button.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--line)}
-input,textarea{font:inherit;background:var(--panel2);color:var(--fg);
+input,textarea,select{font:inherit;background:var(--panel2);color:var(--fg);
   border:1px solid var(--line);border-radius:8px;padding:10px 12px;width:100%}
-input:focus,textarea:focus{outline:none;border-color:var(--accent)}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent)}
 
 .wrap{max-width:1280px;margin:0 auto;padding:18px}
 header{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
@@ -157,7 +157,7 @@ h1{font-size:19px;margin:0;font-weight:600}
 <body>
 <div class="wrap">
   <header>
-    <h1>英语口语陪练</h1>
+    <h1>口语陪练</h1>
     <button class="ghost userchip" id="btnUser" title="切换用户">
       <span id="uAvatar">👤</span>
       <span id="uName">选择用户</span>
@@ -176,8 +176,14 @@ h1{font-size:19px;margin:0;font-weight:600}
     <div class="card">
       <h2>今天想聊什么</h2>
       <textarea id="input" rows="5"
-        placeholder="粘贴一个主题、一段话、一篇文章，或一个网址…&#10;&#10;例如：&#10;· 聊一聊人工智能对就业的影响&#10;· https://en.wikipedia.org/wiki/Remote_work&#10;· 直接粘贴一段英文文章"></textarea>
+        placeholder="粘贴一个主题、一段话、一篇文章，或一个网址…"></textarea>
       <div class="ctrls" style="margin-top:12px">
+        <label class="meter">练习语言
+          <select id="optLang" style="width:auto;padding:7px 10px">
+            <option value="en">英语</option>
+            <option value="ko">韩语</option>
+          </select>
+        </label>
         <button id="btnPrepare">生成话题</button>
         <label class="meter"><input type="checkbox" id="optVp" checked
           style="width:auto"> 只回应我的声音</label>
@@ -429,6 +435,30 @@ let holding = false, pttActive = false;
 let me = null;              // 当前用户
 let enrollWs = null, enrollMic = null, enrollCtx = null,
     enrollNode = null, enrollRec = false, enrollMeter = 0;
+
+// ---------- 练习语言 ----------
+// 语言跟着这一次会话走：备课时传给 /api/prepare，开练时传给
+// WebSocket。localStorage 只用来记住上次的选择，省得每次重选。
+const LANGUAGE_LABELS = { en: "英语", ko: "韩语" };
+let lang = localStorage.getItem("kai.lang") || "en";
+if (!LANGUAGE_LABELS[lang]) lang = "en";
+
+const PLACEHOLDERS = {
+  en: "粘贴一个主题、一段话、一篇文章，或一个网址…\n\n例如：\n"
+    + "· 聊一聊人工智能对就业的影响\n"
+    + "· https://en.wikipedia.org/wiki/Remote_work\n"
+    + "· 直接粘贴一段英文文章",
+  ko: "粘贴一个主题、一段话、一篇文章，或一个网址…\n\n例如：\n"
+    + "· 简单的韩语日常对话\n"
+    + "· 聊一聊第一次去韩国旅行的经历\n"
+    + "· 直接粘贴一段韩语文章",
+};
+
+function applyLangUI() {
+  $("optLang").value = lang;
+  $("input").placeholder = PLACEHOLDERS[lang] || PLACEHOLDERS.en;
+}
+applyLangUI();
 
 function toast(msg, ms = 2600) {
   const t = $("toast");
@@ -737,7 +767,8 @@ function connect(content) {
   // 而且悄无声息，所以这里也不能省。
   ws = new WebSocket(proto + "://" + location.host + "/ws/session"
     + "?user=" + (me ? me.id : "")
-    + "&content=" + encodeURIComponent(content) + "&voiceprint=" + vp);
+    + "&content=" + encodeURIComponent(content) + "&voiceprint=" + vp
+    + "&lang=" + encodeURIComponent(lang));
   ws.binaryType = "arraybuffer";
   ws.onmessage = onServer;
   ws.onclose = (ev) => {
@@ -1062,7 +1093,7 @@ $("btnPrepare").onclick = async () => {
   $("btnPrepare").disabled = true;
   $("setupHint").textContent = "分析中…";
   try {
-    const r = await fetch(api("/api/prepare"), {
+    const r = await fetch(api("/api/prepare") + "&lang=" + encodeURIComponent(lang), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: content, topics: 5 })
@@ -1077,6 +1108,7 @@ $("btnPrepare").onclick = async () => {
     $("setupHint").textContent = (d.kind === "url"
       ? "已抓取网页正文（" + d.chars + " 字符）" : "")
       + "按「" + me.name + "」的画像生成"
+      + " · " + (LANGUAGE_LABELS[d.lang] || LANGUAGE_LABELS[lang])
       + (d.profile_used ? "" : "（还没有该用户的画像，将按通用话题准备）");
   } catch (e) {
     $("setupHint").textContent = "";
@@ -1124,6 +1156,18 @@ $("btnReprepare").onclick = () => {
   prepared = null;
   $("setupHint").textContent = "";
   $("input").focus();
+};
+
+// 换语言等于换了一份备课：已经生成的话题还是上一种语言的，
+// 不清掉的话点「开始」会拿英文计划去开韩语会话。
+$("optLang").onchange = () => {
+  lang = $("optLang").value;
+  if (!LANGUAGE_LABELS[lang]) lang = "en";
+  localStorage.setItem("kai.lang", lang);
+  applyLangUI();
+  $("planCard").classList.add("hidden");
+  prepared = null;
+  $("setupHint").textContent = "";
 };
 
 // 通用确认框。返回 Promise<boolean>，由调用方决定确认后做什么。

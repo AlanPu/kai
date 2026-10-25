@@ -18,6 +18,7 @@ import numpy as np
 
 from ..core.audio import rms
 from ..core.config import Settings
+from ..core.languages import get_language
 from ..core.realtime import (RealtimeSession, SessionFatal, extract_ai_text,
                              is_recoverable_error,
                              extract_audio_delta, extract_transcript,
@@ -94,6 +95,10 @@ class ConversationSession:
     生命周期：start() → push_audio() … → stop()
     """
 
+    # 类级默认值：有些测试用 __new__ 构造对象只填部分字段，
+    # 没有实例属性时也能拿到一个合法的语言，而不是 AttributeError。
+    lang = get_language("en")
+
     def __init__(self, settings: Settings, db: Database, *,
                  session_id: int, user_id: int, instructions: str,
                  on_client: SendToClient,
@@ -102,10 +107,14 @@ class ConversationSession:
                  corrector: Optional[Corrector] = None,
                  profile_store: Optional[ProfileStore] = None,
                  profile_extractor: Optional[ProfileExtractor] = None,
-                 minutes: Optional[int] = None):
+                 minutes: Optional[int] = None,
+                 lang: str = "en"):
         self.s = settings
         self.db = db
         self.session_id = session_id
+        # 本次练习的目标语言。纠错、画像、求援提示词都要跟着它走 ——
+        # 备课选了韩语、纠错却按英语规则判，等于白纠。
+        self.lang = get_language(lang)
         # 画像读写必须知道是谁的 —— 多人共用时写错用户
         # 会把甲的偏好记到乙头上，且很难发现
         self.user_id = user_id
@@ -625,7 +634,8 @@ class ConversationSession:
     async def _correct(self, turn_id: int, text: str) -> None:
         """调用纠错模型，把结果入库并推送前端。"""
         try:
-            items = await asyncio.to_thread(self.corrector.check, text)
+            items = await asyncio.to_thread(
+                self.corrector.check, text, lang=self.lang)
         except Exception as e:
             log.warning("纠错失败: %s", e)
             return
@@ -655,7 +665,8 @@ class ConversationSession:
         if not self.profile_extractor or not self.profile_store:
             return
         try:
-            facts = await asyncio.to_thread(self.profile_extractor.extract, texts)
+            facts = await asyncio.to_thread(
+                self.profile_extractor.extract, texts, lang=self.lang)
         except Exception as e:
             log.warning("画像抽取失败: %s", e)
             return
@@ -866,7 +877,8 @@ class ConversationSession:
         """
         common = ("The user asked you to help them keep going because they "
                   "are stuck. Do NOT ask whether they are still there, and do "
-                  "not mention the silence or apologize. ")
+                  f"not mention the silence or apologize. Reply in "
+                  f"{self.lang.english} only. ")
         if self._nudges_sent <= 1:
             return (common +
                     "Gently continue the conversation: react to what they "

@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from ..core.languages import Language, get_language
 from ..core.llm import LLMClient
 
 log = logging.getLogger(__name__)
@@ -34,31 +35,61 @@ class CorrectionItem:
     phonetic: Optional[str] = None  # 音标
 
 
-SYSTEM_PROMPT = """你是一位英语口语纠错助手，为中文母语的英语学习者服务。
+def build_prompt(lang: Language | None = None) -> str:
+    """
+    纠错提示词。
 
-学生会给你一段他说过的英文（语音转写）。请找出值得纠正的地方。
+    语言相关的部分只有三处：判断标准（该语言的重点语法）、
+    JSON 里的示例、以及发音部分的注意事项。其余「别频繁打断」
+    的约束对所有语言一样。
+    """
+    lang = lang or get_language("en")
+
+    if lang.code == "ko":
+        example = ('    {"kind": "grammar",\n'
+                   '     "severity": "critical",\n'
+                   '     "original": "저는 어제 학교를 갔어요",\n'
+                   '     "suggestion": "저는 어제 학교에 갔어요",\n'
+                   '     "explanation": "가다 表示去某地，地点后面用 에，不用 를",\n'
+                   '     "word": null,\n'
+                   '     "phonetic": null}')
+        pronunciation_note = (
+            "韩语的转写会自然按连音/紧音规则写出，不要把正常的连音\n"
+            "（如 한국어 → 한구거）当成发音错误。")
+    else:
+        example = ('    {"kind": "grammar",\n'
+                   '     "severity": "critical",\n'
+                   '     "original": "I go to park yesterday",\n'
+                   '     "suggestion": "I went to the park yesterday",\n'
+                   '     "explanation": "yesterday 表示过去，动词要用过去式 went",\n'
+                   '     "word": null,\n'
+                   '     "phonetic": null}')
+        pronunciation_note = (
+            "不要把常见的口音差异（如 th/s、l/r、词尾辅音弱化）\n"
+            "标成 critical —— 那些是 ignore 或 minor。")
+
+    return f"""你是一位{lang.label}口语纠错助手，为中文母语的{lang.label}学习者服务。
+
+学生会给你一段他说过的{lang.label}（语音转写）。请找出值得纠正的地方。
 
 ## 纠错的四类
-- grammar：语法错误（时态、单复数、介词、冠词、语序等）
+- grammar：语法错误
 - vocabulary：用词不地道（虽然能懂，但母语者不会这么说）
 - pronunciation：发音问题（**只能依据转写文本推断**，见下方严格限制）
-- fluency：表达不流畅（啰嗦、中式英语、停顿填充词过多）
+- fluency：表达不流畅（啰嗦、直译腔、停顿填充词过多）
+
+## 这个语言要重点看
+{lang.correction_focus}
 
 ## 严重度分级（非常重要）
 - critical：**明显的错误**，会让听者困惑或听起来明显不对。
-  例如：时态用错（"I go there yesterday"）、'think' 读成 'sink' 这种
-  会引发误解的发音错误、严重的中式英语。
-- minor：不够地道，但不影响理解。
-  例如：用词偏书面（"I am very fond of it"）、轻微口音、
-  可以用更自然的说法。
+- minor：不够地道，但不影响理解。可以用更自然的说法。
 - ignore：可以接受的说法，**不需要提醒**。宁可少提也不要多提。
 
 ## 严格限制
 1. **发音纠错必须非常保守。** 你只能看到文字，看不到声音。
-   只有当某个词的拼写/上下文强烈暗示明显发音错误时才标注
-   （例如学生写出 "sink" 但显然想说 "think"）。
-   **绝对不要**把常见的口音差异（如 th/s、l/r、词尾辅音弱化）
-   标成 critical —— 那些是 ignore 或 minor。
+   只有当拼写/上下文强烈暗示明显发音错误时才标注。
+   {pronunciation_note}
    拿不准就不要报发音问题。
 2. 每次最多报 3 条纠错，按重要程度排序。
 3. 如果这句话没有值得纠正的地方，就返回空数组 —— 这是完全可以的。
@@ -66,17 +97,11 @@ SYSTEM_PROMPT = """你是一位英语口语纠错助手，为中文母语的英�
 5. original 必须是学生原话里的片段，suggestion 是改好的说法。
 
 严格按 JSON 输出，不要任何额外文字：
-{
+{{
   "corrections": [
-    {"kind": "grammar",
-     "severity": "critical",
-     "original": "I go to park yesterday",
-     "suggestion": "I went to the park yesterday",
-     "explanation": "yesterday 表示过去，动词要用过去式 went",
-     "word": null,
-     "phonetic": null}
+{example}
   ]
-}"""
+}}"""
 
 
 class Corrector:
@@ -86,19 +111,26 @@ class Corrector:
         self.llm = llm or LLMClient()
 
     def check(self, text: str, *, context: str = "",
-              max_items: int = 3) -> list[CorrectionItem]:
+              max_items: int = 3,
+              lang: Language | str = "en") -> list[CorrectionItem]:
         """
-        检查一段英文。
+        检查一段目标语言的话。
 
         text    ：用户说的话（转写文本）
         context ：可选的上下文（前几轮对话），帮助判断时态等
+        lang    ：目标语言（en / ko），决定语法判断标准和示例
         """
         text = (text or "").strip()
         if not text:
             return []
 
-        # 太短的输入（如 "yes"、"ok"）没有纠错价值，省一次调用
-        if len(text.split()) < 3:
+        language = lang if isinstance(lang, Language) else get_language(lang)
+
+        # 太短的输入没有纠错价值，省一次调用。
+        # 韩语按词切分后通常比英语短（"저는 학생이에요" 只有两个词），
+        # 用英语的阈值会把正常的短句全部跳过。
+        min_words = 3 if language.code == "en" else 2
+        if len(text.split()) < min_words:
             return []
 
         user = f"学生说的话：\n{text}"
@@ -106,11 +138,13 @@ class Corrector:
             user = f"上文（仅供参考）：\n{context.strip()[:800]}\n\n{user}"
 
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_prompt(language)},
             {"role": "user", "content": user},
         ]
 
-        data = self.llm.chat_json(messages, temperature=0.3, max_tokens=1200)
+        # 1200 对推理模型不够：思考本身就可能上千 token，
+        # 正文被截断后 JSON 解析失败，纠错等于白做。
+        data = self.llm.chat_json(messages, temperature=0.3, max_tokens=2500)
         items = self._normalize(data)
         return items[:max_items]
 

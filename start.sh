@@ -135,7 +135,7 @@ done
 
 mkdir -p "$LOG_DIR"
 
-echo "英语口语陪练"
+echo "口语陪练（英语 / 韩语）"
 echo "----------"
 stop_server
 

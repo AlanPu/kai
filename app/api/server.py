@@ -26,6 +26,7 @@ from ..core.config import Settings, load_settings, ssl_context
 from ..core.content import load_content
 from ..core.enroll import (DEFAULT_PROMPTS_LIST, MIN_SAMPLES,
                            EnrollmentSession)
+from ..core.languages import get_language
 from ..core.realtime import SessionFatal
 from ..core.voiceprint import SpeakerVerifier
 from ..services.corrector import Corrector
@@ -455,15 +456,21 @@ class PrepareIn(BaseModel):
 
 
 @app.post("/api/prepare")
-async def prepare(body: PrepareIn, user: Optional[int] = None):
+async def prepare(body: PrepareIn, user: Optional[int] = None,
+                  lang: str = "en"):
     """
     需求 1：输入主题/段落/文章/网址 → 分析内容并预先规划聊什么。
 
     需求 6：把**这个用户**的画像注入，让话题贴近他本人。
+
+    lang：本次要练的语言（en / ko）。它决定引导句和词汇用哪种语言写 ——
+    同一段素材，选英语备出来的是英文问题，选韩语是韩语问题。
     """
     text = (body.content or "").strip()
     if not text:
         raise HTTPException(400, "内容不能为空")
+
+    language = get_language(lang)
 
     # 备课必须认准人。回退到"最近用过的那个人"会把甲的背景
     # 掺进乙的话题里，而用户完全看不出问题 —— 见 _require_user。
@@ -479,19 +486,20 @@ async def prepare(body: PrepareIn, user: Optional[int] = None):
     try:
         plan = await asyncio.to_thread(
             Planner().plan, content, profile_summary=summary,
-            n_topics=max(3, min(body.topics, 8)))
+            n_topics=max(3, min(body.topics, 8)), lang=language)
     except Exception as e:
         raise HTTPException(502, f"话题规划失败：{e}")
 
     # 记下来，让紧接着的「开始」直接用这一份 ——
     # 否则模型会重新构思一次，用户预览的和实际聊的不是同一批话题。
-    plan_cache().put(u.id, text, plan)
+    plan_cache().put(u.id, text, plan, language.code)
 
     return {
         "kind": content.kind,
         "title": content.title,
         "chars": len(content.text),
         "user_id": u.id,
+        "lang": language.code,
         "profile_used": bool(summary.strip()),
         "plan": plan.to_dict(),
     }
@@ -784,6 +792,10 @@ async def ws_session(ws: WebSocket):
         except ValueError:
             minutes = s.session_minutes
 
+        # 目标语言跟着这一次会话走。前端连接时必须带上：
+        # 少带就按英语处理，而不是去猜用户上次练了什么。
+        language = get_language(ws.query_params.get("lang", "en"))
+
         # ---- 画像（备课和会话提示词必须用同一份）----
         #
         # 这里只读一次是有意为之：备课（Planner）和语音提示词
@@ -806,21 +818,23 @@ async def ws_session(ws: WebSocket):
         # 真正开练时的话题必须是同一个 —— 让模型重新构思一次，
         # 预览就只是个参考，看着像"点了没反应"。
         # 没备过课（直接点开始、或缓存过期）才现场生成。
-        plan = plan_cache().get(user.id, raw_content)
+        plan = plan_cache().get(user.id, raw_content, language.code)
         reused = plan is not None
         if not reused:
             await ws.send_json({"type": "status", "stage": "planning"})
             try:
                 plan = await asyncio.to_thread(
-                    Planner().plan, content, profile_summary=summary)
+                    Planner().plan, content, profile_summary=summary,
+                    lang=language)
             except Exception as e:
                 await ws.send_json({"type": "error",
                                     "error": f"话题规划失败：{e}"})
                 await ws.close()
                 return
-            plan_cache().put(user.id, raw_content, plan)
+            plan_cache().put(user.id, raw_content, plan, language.code)
         else:
-            log.info("复用已备好的话题计划 (user=%s)", user.name)
+            log.info("复用已备好的话题计划 (user=%s lang=%s)",
+                     user.name, language.code)
         await ws.send_json({"type": "plan", "plan": plan.to_dict(),
                             "reused": reused})
 
@@ -857,7 +871,7 @@ async def ws_session(ws: WebSocket):
                 })
 
         instructions = build_tutor_instructions(
-            plan, profile_summary=summary, minutes=minutes)
+            plan, profile_summary=summary, minutes=minutes, lang=language)
         async def on_client(msg: dict) -> None:
             try:
                 await ws.send_json(msg)
@@ -869,7 +883,8 @@ async def ws_session(ws: WebSocket):
             instructions=instructions,
             on_client=on_client, voiceprint=verifier,
             corrector=Corrector(), profile_store=store,
-            profile_extractor=ProfileExtractor(), minutes=minutes)
+            profile_extractor=ProfileExtractor(), minutes=minutes,
+            lang=language.code)
 
         await sess.start()
         await ws.send_json({"type": "session", "session_id": sid,

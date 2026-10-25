@@ -2096,7 +2096,8 @@ def _patch_server(store, db, monkeypatch, recorder):
         def __init__(self):
             self.llm = None
 
-        def plan(self, content, *, profile_summary="", n_topics=5):
+        def plan(self, content, *, profile_summary="", n_topics=5,
+                 lang="en"):
             return recorder(content, profile_summary=profile_summary,
                             n_topics=n_topics)
 
@@ -2474,7 +2475,8 @@ def test_prepare_then_ws_reuses_same_plan(store, db, monkeypatch):
         def __init__(self):
             pass
 
-        def plan(self, content, *, profile_summary="", n_topics=5):
+        def plan(self, content, *, profile_summary="", n_topics=5,
+                 lang="en"):
             calls.append(profile_summary)
             # 每次返回不同内容：若真调了两次，用户就能看出两份不一样
             return _make_plan(f"第{len(calls)}次")
@@ -2516,7 +2518,8 @@ def test_ws_does_not_reuse_other_users_plan(store, db, monkeypatch):
         def __init__(self):
             pass
 
-        def plan(self, content, *, profile_summary="", n_topics=5):
+        def plan(self, content, *, profile_summary="", n_topics=5,
+                 lang="en"):
             calls.append(1)
             return _make_plan(f"第{len(calls)}次")
 
@@ -2601,11 +2604,12 @@ def test_ws_actually_reuses_cached_plan(store, db, monkeypatch):
         def __init__(self):
             pass
 
-        def plan(self, content, *, profile_summary="", n_topics=5):
+        def plan(self, content, *, profile_summary="", n_topics=5,
+                 lang="en"):
             calls.append(1)
             return _make_plan(f"第{len(calls)}次")
 
-    def fake_build(plan, *, profile_summary="", minutes=30):
+    def fake_build(plan, *, profile_summary="", minutes=30, lang="en"):
         # 在这里停住，并记下收到的计划。
         # 抛 srv._StopRequested 走的是正常收尾路径 —— ws_session 有
         # except 分支接住它，不会变成报错而掩盖真正的断言失败。

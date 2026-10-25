@@ -6,9 +6,9 @@
 模型重新构思仍会给出不同的话题 —— 界面上预览的是 A，
 真正开始练习时聊的是 B，用户只会觉得"AI 没听我刚说的"。
 
-做法是把第一次备课的结果按 (用户, 素材) 记下来，第二次直接取用。
+做法是把第一次备课的结果按 (用户, 语言, 素材) 记下来，第二次直接取用。
 
-## 为什么按 (user_id, 内容指纹) 而不是 token
+## 为什么按 (user_id, 语言, 内容指纹) 而不是 token
 
 直觉上会想让 /api/prepare 返回一个 token，前端再传回来。
 但 WS 本来就收到了 `content`（`server.py:584`），服务端能自己
@@ -82,24 +82,30 @@ class PlanCache:
                  max_entries: int = MAX_ENTRIES):
         self.ttl = ttl_sec
         self.max_entries = max_entries
-        self._data: dict[tuple[int, str], _Entry] = {}
+        self._data: dict[tuple[int, str, str], _Entry] = {}
 
     # ---------- 存取 ----------
 
-    def put(self, user_id: int, content: str, plan: Plan) -> None:
+    def put(self, user_id: int, content: str, plan: Plan,
+            lang: str = "en") -> None:
         self._purge()
-        key = (user_id, content_fingerprint(content))
+        # 键里必须带语言：同一句"简单的韩语对话"，
+        # 选英语时备的是英文话题，选韩语时备的是韩语话题，
+        # 不区分就会把英文计划拿去开韩语会话。
+        key = (user_id, (lang or "en").lower(), content_fingerprint(content))
         self._data[key] = _Entry(user_id=user_id,
-                                 fingerprint=key[1], plan=plan)
+                                 fingerprint=key[2], plan=plan)
         # 满了就丢最旧的一条。字典保序，最旧的在最前。
         while len(self._data) > self.max_entries:
             oldest = next(iter(self._data))
             del self._data[oldest]
 
-    def get(self, user_id: int, content: str) -> Optional[Plan]:
+    def get(self, user_id: int, content: str,
+            lang: str = "en") -> Optional[Plan]:
         """命中返回计划，否则 None（调用方改为现备课）。"""
         self._purge()
-        e = self._data.get((user_id, content_fingerprint(content)))
+        e = self._data.get((user_id, (lang or "en").lower(),
+                            content_fingerprint(content)))
         return e.plan if e else None
 
     def invalidate_user(self, user_id: int) -> None:

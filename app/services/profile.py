@@ -19,6 +19,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from ..core.languages import Language, get_language
 from ..core.llm import LLMClient
 from ..storage.db import Database
 from ..storage.models import ProfileFact
@@ -26,26 +27,28 @@ from ..storage.models import ProfileFact
 log = logging.getLogger(__name__)
 
 # 画像分类。限定范围避免模型自由发挥导致数据杂乱。
+# 注意措辞不绑死英语：同一个人可能今天练英语、明天练韩语，
+# 画像必须能跨语言复用，否则换个语种就等于从零开始。
 CATEGORIES = {
     "background": "职业、居住地、教育、家庭等客观背景",
     "interest": "兴趣爱好、喜欢的话题",
     "preference": "学习偏好、沟通风格偏好",
-    "goal": "英语学习目标、想提升的方向",
+    "goal": "语言学习目标、想提升的方向",
     "language": "反复出现的语言问题、常犯错误",
     "life": "生活习惯、日常安排",
 }
 
-EXTRACT_PROMPT = """你是一位细心的英语口语老师，正在记录对学生的了解。
+EXTRACT_PROMPT = """你是一位细心的语言口语老师，正在记录对学生的了解。
 
-学生会给你一段他刚说的话（语音转写的英文）。请从中提取
+学生会给你一段他刚说的话（语音转写）。请从中提取
 **关于这个人的、值得长期记住的事实**。
 
 ## 分类（category 只能取以下之一）
 - background：职业、居住地、教育背景、家庭情况
 - interest：兴趣爱好、喜欢的话题、常做的事
 - preference：学习偏好、喜欢的沟通方式
-- goal：英语学习目标、想提升的方向
-- language：反复出现的语言错误（如"总是漏掉冠词"）
+- goal：语言学习目标、想提升的方向
+- language：反复出现的语言错误（如"总是漏掉冠词"、"助词用错"）
 - life：生活习惯、日常安排
 
 ## 要求
@@ -61,6 +64,8 @@ EXTRACT_PROMPT = """你是一位细心的英语口语老师，正在记录对学
 5. **宁缺毋滥。** 如果这段话没有任何值得长期记住的个人信息，
    返回空数组 —— 这是很常见的情况。
    绝大多数寒暄、观点表达都不含个人信息。
+6. 学生可能用非母语（英语/韩语）说话，转写里会有语法错误 ——
+   提取事实时不要因为语法错误而改变事实本身的含义。
 
 严格按 JSON 输出：
 {"facts": [{"category": "interest", "key": "hobby",
@@ -73,19 +78,23 @@ class ProfileExtractor:
     def __init__(self, llm: Optional[LLMClient] = None):
         self.llm = llm or LLMClient()
 
-    def extract(self, texts: list[str]) -> list[ProfileFact]:
+    def extract(self, texts: list[str],
+                lang: Language | str = "en") -> list[ProfileFact]:
         """从若干句用户发言中抽取事实。"""
         joined = "\n".join(t.strip() for t in texts if t and t.strip())
         if len(joined) < 15:      # 太短没有信息量，省一次调用
             return []
 
+        language = lang if isinstance(lang, Language) else get_language(lang)
         messages = [
             {"role": "system", "content": EXTRACT_PROMPT},
-            {"role": "user", "content": f"学生说的话：\n{joined[:3000]}"},
+            {"role": "user",
+             "content": f"学生说的话（{language.label}）：\n{joined[:3000]}"},
         ]
         try:
+            # 推理模型的思考也占 max_tokens，800 会把正文挤掉
             data = self.llm.chat_json(messages, temperature=0.2,
-                                      max_tokens=800)
+                                      max_tokens=1500)
         except Exception as e:
             log.warning("画像抽取失败: %s", e)
             return []
@@ -234,7 +243,7 @@ class ProfileStore:
         by_cat = _group_by_category(facts)
 
         lines = [
-            "# 我的英语学习画像",
+            "# 我的语言学习画像",
             "",
             "> 这份文件由程序自动生成，记录了 AI 对你的了解。",
             "> 它是**给人看的**：如果某条记错了，直接删掉或修改即可。",
